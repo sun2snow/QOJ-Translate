@@ -13,7 +13,7 @@ const resource = {
   katexCSS: readFileSync(path.join(ROOT, 'node_modules/katex/dist/katex.min.css'), 'utf8'),
 };
 const pdfBytes = readFileSync(path.join(__dirname, 'fixtures/statement.pdf'));
-const pdfBase64 = pdfBytes.toString('base64');
+const multiPDFBytes = readFileSync(path.join(__dirname, 'fixtures/multipage.pdf'));
 const fixtureHeader = `<meta charset="utf-8"><style>
   body{font:15px/1.6 Arial,sans-serif;color:#253247;margin:16px;background:#fff}
   .container{max-width:1000px;margin:30px auto}h1{font-size:26px;margin:0 0 6px}.meta{color:#8992a2;font-size:13px;margin-bottom:24px}
@@ -31,7 +31,8 @@ const fixtures = {
   pdf: `<!doctype html>${fixtureHeader}<div class="container">${fixtureTitle}<div id="tab-statement"><article style="display: block !important"><iframe src="/download.php?contest_id=4576&id=22881&type=statement" title="PDF"></iframe></article></div></div>`,
 };
 
-async function setup(t, kind) {
+async function setup(t, kind, { multi = false } = {}) {
+  const fixturePDF = multi ? multiPDFBytes : pdfBytes;
   const browser = await chromium.launch({ executablePath: chrome, headless: true, args: ['--no-sandbox', '--disable-gpu'] });
   t.after(() => browser.close());
   const page = await browser.newPage();
@@ -40,7 +41,7 @@ async function setup(t, kind) {
   await page.route('**/*', route => {
     const url = new URL(route.request().url());
     if (url.hostname === 'qoj.ac' && url.pathname.includes('/problem/')) return route.fulfill({ body: fixtures[kind], contentType: 'text/html' });
-    if (url.hostname === 'qoj.ac' && url.pathname === '/download.php') return route.fulfill({ body: pdfBytes, contentType: 'application/pdf' });
+    if (url.hostname === 'qoj.ac' && url.pathname === '/download.php') return route.fulfill({ body: fixturePDF, contentType: 'application/pdf' });
     // Tests never contact QOJ, the configured proxy or a CDN.
     return route.abort();
   });
@@ -55,6 +56,8 @@ async function setup(t, kind) {
     window.GM_setValue = (key, value) => localStorage.setItem(key, JSON.stringify(value));
     window.GM_getResourceText = name => resource[name];
     window.__requests = [];
+    window.__responses = [];
+    window.__generation = 1;
     window.__mode = 'success';
     window.__aborts = 0;
     window.GM_xmlhttpRequest = options => {
@@ -72,11 +75,17 @@ async function setup(t, kind) {
         const body = JSON.parse(options.data);
         window.__requests.push(body);
         const input = JSON.parse(body.input[0].content[0].text);
+        const injected = window.__responses.shift();
+        if (injected) {
+          const responseBody = injected.body || { status: 'completed', output: [{ type: 'message', content: [{ type: 'output_text', text: injected.text }] }] };
+          options.onload({ status: injected.status || 200, finalUrl: options.url, responseText: JSON.stringify(responseBody) });
+          return;
+        }
         const data = input.segments ? {
           translations: input.segments.map(s => ({ id: s.id, text: '中文：' + s.text })),
         } : {
           blocks: [
-            { type: 'heading', text: '子集和（合成测试题）' },
+            { type: 'heading', text: `子集和（合成测试题）第 ${input.page} 页 v${window.__generation}` },
             { type: 'paragraph', text: '给定整数 \\(n\\)，计算所有数值的和。输出字符串 Joker。' },
             ...(input.imageProvided ? [{ type: 'original', box: [90, 330, 820, 180] }] : [{ type: 'verbatim', text: '3 10\nJoker' }]),
           ],
@@ -87,7 +96,7 @@ async function setup(t, kind) {
       }, 5);
       return { abort() { aborted = true; clearTimeout(timer); window.__aborts++; options.onabort?.(); } };
     };
-  }, { resource, pdfBase64 });
+  }, { resource, pdfBase64: fixturePDF.toString('base64') });
   const url = kind === 'html' ? 'https://qoj.ac/contest/4113/problem/20245' : 'https://qoj.ac/contest/4576/problem/22881';
   await page.goto(url);
   async function install() {
@@ -340,5 +349,87 @@ test('Chrome: toolbar remounts after delayed statements and supports custom ance
   await completed();
   assert.equal(await page.locator('[data-qoj-translator="toolbar"]').count(), 1);
   assert.match(await page.locator('article').textContent(), /中文/);
+  assert.deepEqual(errors, []);
+});
+
+test('Chrome: failed PDF page keeps original visible, exports redacted diagnostics, and resumes after reload', options, async t => {
+  const { page, toolbar, completed, errors, install } = await setup(t, 'pdf', { multi: true });
+  const before = await page.locator('#tab-statement > article').innerHTML();
+  await page.evaluate(() => {
+    const bad = String.raw`{"blocks":[{"type":"formula","text":"synthetic-test-key \(x\)","box":null}]}`;
+    window.__responses = [null, { text: bad }, { text: bad }];
+  });
+  await toolbar.getByRole('button', { name: '翻译为中文', exact: true }).click();
+  await toolbar.locator('.status').filter({ hasText: '已校验完成 1 页' }).waitFor();
+  assert.match(await toolbar.locator('.status').textContent(), /第 2\/3 页/);
+  assert.equal(await page.locator('#tab-statement > article').isVisible(), true);
+  assert.equal(await page.locator('#tab-statement > article').innerHTML(), before);
+  assert.equal(await page.locator('[data-qoj-translator="pdf"]').count(), 0);
+  assert.equal(await toolbar.getByRole('button', { name: '继续未完成页', exact: true }).isEnabled(), true);
+  assert.deepEqual(await page.evaluate(() => window.__requests.map(r => JSON.parse(r.input[0].content[0].text).page)), [1, 2, 2]);
+  assert.equal(await page.evaluate(() => Object.keys(GM_getValue('qoj-translator-cache-v3', {})).length), 1);
+  await toolbar.getByRole('button', { name: '更多操作', exact: true }).click();
+  page.once('dialog', dialog => dialog.accept());
+  const downloaded = page.waitForEvent('download');
+  await toolbar.getByRole('button', { name: '导出 PDF 诊断', exact: true }).click();
+  const download = await downloaded;
+  const raw = readFileSync(await download.path(), 'utf8');
+  const diagnostic = JSON.parse(raw);
+  assert.equal(diagnostic.currentPage, 2);
+  assert.equal(diagnostic.status, 'failed');
+  assert.equal(diagnostic.errorCode, 'OUTPUT_JSON');
+  assert.deepEqual(diagnostic.completedPages, [1]);
+  assert.equal(diagnostic.events.at(-1).attempt, 'repair');
+  assert.ok(diagnostic.events.at(-1).outputText.includes('[REDACTED]'));
+  assert.ok(!raw.includes('synthetic-test-key'));
+  assert.ok(!raw.includes('data:image/'));
+  // Durable page caching, not just a happy-path in-memory retry.
+  await page.reload();
+  await install();
+  await toolbar.getByRole('button', { name: '翻译为中文', exact: true }).click();
+  await completed();
+  assert.deepEqual(await page.evaluate(() => window.__requests.map(r => JSON.parse(r.input[0].content[0].text).page)), [2, 3]);
+  assert.equal(await page.locator('[data-qoj-translator="pdf"]').locator('article').count(), 3);
+  assert.deepEqual(errors, []);
+});
+
+test('Chrome: forced PDF refresh invalidates old pages before a failure and resume never mixes generations', options, async t => {
+  const { page, toolbar, completed, errors } = await setup(t, 'pdf', { multi: true });
+  await toolbar.getByRole('button', { name: '翻译为中文', exact: true }).click();
+  await completed();
+  await page.evaluate(() => {
+    window.__generation = 2;
+    window.__responses = [null, { text: 'Not JSON' }, { text: 'Still not JSON' }];
+  });
+  await toolbar.getByRole('button', { name: '更多操作', exact: true }).click();
+  page.once('dialog', dialog => dialog.accept());
+  await toolbar.getByRole('button', { name: '重新翻译', exact: true }).click();
+  await toolbar.locator('.status').filter({ hasText: '已校验完成 1 页' }).waitFor();
+  assert.equal(await page.evaluate(() => Object.keys(GM_getValue('qoj-translator-cache-v3', {})).length), 1);
+  await toolbar.getByRole('button', { name: '继续未完成页', exact: true }).click();
+  await completed();
+  assert.deepEqual(await page.evaluate(() => window.__requests.map(r => JSON.parse(r.input[0].content[0].text).page)), [1, 2, 3, 1, 2, 2, 2, 3]);
+  const headings = await page.locator('[data-qoj-translator="pdf"]').locator('article h3').allTextContents();
+  assert.equal(headings.length, 3);
+  assert.ok(headings.every(text => text.includes('v2')));
+  assert.deepEqual(errors, []);
+});
+
+test('Chrome: truncation requires manual budget change and never applies partial or auto-repaired output', options, async t => {
+  const { page, toolbar, completed, errors } = await setup(t, 'pdf');
+  await page.evaluate(() => {
+    window.__responses = [{ body: { status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' }, output_text: '{"blocks":[' } }];
+  });
+  await toolbar.getByRole('button', { name: '翻译为中文', exact: true }).click();
+  await toolbar.locator('.status').filter({ hasText: 'API 回复被截断' }).waitFor();
+  assert.equal(await page.evaluate(() => window.__requests.length), 1);
+  assert.equal(await page.locator('#tab-statement > article').isVisible(), true);
+  assert.equal(await page.locator('[data-qoj-translator="pdf"]').count(), 0);
+  await toolbar.getByRole('button', { name: '设置', exact: true }).click();
+  await toolbar.locator('input[name="pdfOutputTokens"]').fill('32768');
+  await toolbar.getByRole('button', { name: '保存设置', exact: true }).click();
+  await toolbar.getByRole('button', { name: '继续未完成页', exact: true }).click();
+  await completed();
+  assert.deepEqual(await page.evaluate(() => window.__requests.map(r => r.max_output_tokens)), [16384, 32768]);
   assert.deepEqual(errors, []);
 });
