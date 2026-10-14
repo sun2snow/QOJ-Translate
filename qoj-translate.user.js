@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         QOJ 中文题面 · Responses API
 // @namespace    qoj-translate
-// @version      0.4.0
+// @version      0.4.1
 // @description  HTML 原位翻译、PDF 中文阅读版，保留原文并随时切换；兼容 OpenAI Responses API。
 // @match        https://qoj.ac/problem/*
 // @match        https://qoj.ac/contest/*/problem/*
@@ -501,7 +501,7 @@ A page may start/end mid-sentence: translate that fragment without adding missin
   }
   function createPDFDiagnostic(config, pageURL) {
     const endpoint = new URL(config.endpoint), page = new URL(pageURL);
-    return { scriptVersion: '0.4.0', createdAt: new Date().toISOString(),
+    return { scriptVersion: '0.4.1', createdAt: new Date().toISOString(),
       endpoint: redactDiagnostic(endpoint.origin + endpoint.pathname, config.apiKey),
       pageURL: page.origin + page.pathname, model: redactDiagnostic(config.model, config.apiKey),
       pdfImages: config.pdfImages, maxOutputTokens: config.pdfOutputTokens, autoRepair: config.pdfAutoRepair,
@@ -549,27 +549,59 @@ A page may start/end mid-sentence: translate that fragment without adding missin
     }
     return null;
   }
-  function findStatementRoot(doc, selector = '') {
+  function findStatementPanel(doc) {
+    return doc.querySelector('#tab-statement') || doc.querySelector('#statement') ||
+      doc.querySelector('#problem-statement') || doc.querySelector('#problem-statement-content') || doc.querySelector('.problem-statement');
+  }
+  function findStatementRoot(doc, selector = '', knownRoot = null) {
+    const panel = findStatementPanel(doc);
     let root;
     if (selector.trim()) {
       try { root = doc.querySelector(selector.trim()); } catch { throw new Error('自定义题面 CSS 选择器无效。'); }
       if (!root) throw new Error('自定义题面选择器没有匹配元素。');
     } else {
+      // A temporarily missing statement must not make discussion/submission
+      // articles become the new source while the site switches/rebuilds tabs.
+      if (!panel && ['tab-statement', 'statement', 'problem-statement', 'problem-statement-content'].some(id =>
+        doc.querySelector(`[href="#${id}"],[data-target="#${id}"],[data-bs-target="#${id}"],[aria-controls~="${id}"]`))) {
+        throw new Error('题面标签暂未加载，请返回题面后重试。');
+      }
       const selectors = [
-        '#tab-statement article', '#problem-statement', '#problem-statement-content',
+        '[data-qoj-statement-source]', '#tab-statement article', '#problem-statement', '#problem-statement-content',
         '#statement article', '.problem-statement', '#tab-statement .uoj-markdown',
         '#tab-statement .markdown-body', '#tab-statement', '#statement',
         'main article', '.uoj-content article', '.container article',
       ];
       for (const selector of selectors) {
         const candidate = doc.querySelector(selector);
-        if (candidate && (candidate.textContent.trim().length > 30 || candidate.querySelector('iframe,object,embed'))) {
+        if (candidate && (!panel || panel.contains(candidate)) &&
+            (candidate.textContent.trim().length > (panel || candidate === knownRoot ? 0 : 30) || candidate.querySelector('iframe,object,embed'))) {
           root = candidate; break;
         }
       }
     }
     if (!root || root === doc.body || root === doc.documentElement || root.closest('[data-qoj-translator]')) {
       throw new Error('未识别到安全的题面区域。请切到题面标签，或在设置中填写题面 CSS 选择器。');
+    }
+    // Even a custom ancestor selector must not include sibling site tabs.
+    if (panel && root.contains(panel)) root = panel;
+    const controlledTab = root.id && Array.from(doc.querySelectorAll('[role="tab"],[data-toggle="tab"],[data-bs-toggle="tab"]')).some(tab =>
+      [tab.getAttribute('href'), tab.getAttribute('data-target'), tab.getAttribute('data-bs-target')].includes(`#${root.id}`) ||
+      (tab.getAttribute('aria-controls') || '').split(/\s+/).includes(root.id));
+    if (controlledTab || root.parentElement?.matches('.tab-content') ||
+        root.matches('#tab-statement,#statement,#problem-statement,#problem-statement-content,.problem-statement,.tab-pane,[role="tabpanel"]')) {
+      // Never hide the site's tab panel itself. Keep source, toolbar and reader
+      // INSIDE it so the site's own class/style/hidden state governs all three.
+      let source = Array.from(root.children).find(el => el.hasAttribute('data-qoj-statement-source'));
+      if (!source) {
+        source = element(doc, 'div', null, { 'data-qoj-statement-source': '' });
+        for (const node of Array.from(root.childNodes)) {
+          if (node.nodeType === 1 && node.matches('[data-qoj-translator]')) continue;
+          source.append(node);
+        }
+        root.append(source);
+      }
+      root = source;
     }
     return root;
   }
@@ -895,12 +927,13 @@ A page may start/end mid-sentence: translate that fragment without adding missin
 
   function createUI(currentConfig) {
     const host = element(document, 'div', null, { 'data-qoj-translator': 'toolbar', translate: 'no' });
-    // The toolbar is a sibling of the statement, never a fixed overlay or part
-    // of the source that gets translated/hidden when switching PDF views.
+    // Toolbar and reader are siblings of the source INSIDE the site's statement
+    // panel, never an overlay or part of the source hidden by language toggles.
     host.style.cssText = 'display:block;position:static;float:none;clear:both;max-width:100%;margin:12px 0 16px;color-scheme:light;';
     const shadow = host.attachShadow({ mode: 'closed' });
     shadow.append(element(document, 'style', `
       :host{all:initial;display:block;container-type:inline-size;font:13px/1.5 system-ui,sans-serif;color:#263448;color-scheme:light}
+      :host([hidden]){display:none!important}
       *{box-sizing:border-box}button,input{font:inherit}button{cursor:pointer;white-space:nowrap}
       button{min-height:30px;padding:4px 10px;border:1px solid transparent;border-radius:5px;background:transparent;color:#526076}
       button:hover:not(:disabled){background:#eef3f9;color:#244e93}button:disabled{opacity:.45;cursor:default}
@@ -1012,19 +1045,36 @@ A page may start/end mid-sentence: translate that fragment without adding missin
     dialog.append(header, form);
     shadow.append(dialog);
 
+    let boundRoot = null, rootListener = () => {};
     function mount(root) {
-      // Do not relocate an open native dialog, which would close its top layer.
-      if (dialog.open) return;
       if (!root) {
-        try { root = findStatementRoot(document, currentConfig().selector); } catch { /* Keep settings reachable even if detection fails. */ }
+        try { root = findStatementRoot(document, currentConfig().selector, boundRoot); } catch { root = null; }
       }
-      let anchor = root || document.querySelector('main,.uoj-content,.container');
+      if (root !== boundRoot) {
+        boundRoot = root;
+        if (dialog.open) dialog.close();
+        rootListener(root);
+      }
+      // Don't move an open dialog, unless its original source has disappeared.
+      if (dialog.open && host.isConnected) return;
+      if (!root) {
+        // Keep settings available only INSIDE a known statement panel; never
+        // fall back to body/main, where we'd cover unrelated tabs.
+        const panel = findStatementPanel(document);
+        if (panel) {
+          if (host.parentNode !== panel) panel.prepend(host);
+          if (host.hidden) host.hidden = false;
+        } else if (!host.hidden) host.hidden = true;
+        return;
+      }
+      if (host.hidden) host.hidden = false;
+      let anchor = root;
       // The PDF reading edition is inserted immediately before the source.
       // Always stay above BOTH editions when the MutationObserver runs.
       if (root?.previousElementSibling?.matches('[data-qoj-translator="pdf"]')) anchor = root.previousElementSibling;
       if (anchor && anchor !== host && !host.contains(anchor)) {
         if (anchor.previousElementSibling !== host) anchor.before(host);
-      } else if (document.body.firstElementChild !== host) document.body.prepend(host);
+      }
     }
     mount();
     let queued = false;
@@ -1113,7 +1163,7 @@ A page may start/end mid-sentence: translate that fragment without adding missin
       resetFormat.disabled = busy;
       statusGroup.classList.toggle('busy', busy);
       if (busy) { detail.hidden = true; info.setAttribute('aria-expanded', 'false'); closeMore(); }
-      if (actionHadFocus) (busy ? cancel : hasResult ? (showingChinese ? chinese : original) : translate).focus();
+      if (actionHadFocus && host.getClientRects().length) (busy ? cancel : hasResult ? (showingChinese ? chinese : original) : translate).focus();
     };
     const getConfig = () => Object.fromEntries(Object.entries(inputs).map(([key, input]) => [key,
       input.type === 'checkbox' ? input.checked : input.type === 'number' ? Number(input.value) : input.value.trim(),
@@ -1122,6 +1172,7 @@ A page may start/end mid-sentence: translate that fragment without adding missin
     return {
       host, translate, original, chinese, retranslate, cancel, settings, form, save, clear, diagnostic, resetFormat,
       setStatus, setFormError, setState, fill, getConfig, openSettings, closeSettings, closeMore, mount,
+      watchRoot: listener => { rootListener = listener; },
     };
   }
 
@@ -1391,9 +1442,21 @@ A page may start/end mid-sentence: translate that fragment without adding missin
     const ui = createUI(() => config);
     ui.fill(config);
     if (config.apiKey) ui.setStatus('已就绪 · 点击翻译才发送题面；PDF 默认还会发送页图。');
-    let controller = null, result = null, chinese = false, resumable = false, lastDiagnostic = null;
+    let controller = null, result = null, chinese = false, resumable = false, lastDiagnostic = null, activeRoot = null;
     const update = () => ui.setState(!!controller, !!result, chinese, resumable, !!lastDiagnostic);
     update();
+    ui.watchRoot(root => {
+      if (!activeRoot || root === activeRoot) return;
+      // Visibility-only tab switches do not change the root. A replacement is
+      // different: discard stale DOM bindings and abort any in-flight task.
+      controller?.abort();
+      result?.dispose();
+      result = null;
+      activeRoot = null;
+      chinese = resumable = false;
+      ui.setStatus('题面区域已变化，请返回题面后重新翻译；可用缓存仍会复用。');
+      update();
+    });
     ui.form.onsubmit = event => {
       event.preventDefault();
       if (controller) return;
@@ -1441,10 +1504,11 @@ A page may start/end mid-sentence: translate that fragment without adding missin
       if (result) { result.dispose(); result = null; chinese = false; }
       controller = new AbortController();
       const signal = controller.signal;
-      let runReport = null;
+      let runReport = null, jobRoot = null;
       update();
       try {
         const target = detectStatement(document, location.href, config);
+        jobRoot = activeRoot = target.root;
         if (target.kind === 'pdf') runReport = lastDiagnostic = createPDFDiagnostic(config, location.href);
         resumable = false;
         ui.mount(target.root);
@@ -1452,13 +1516,20 @@ A page may start/end mid-sentence: translate that fragment without adding missin
         result = target.kind === 'pdf'
           ? await translatePDF(target, { ...config }, signal, ui.setStatus, force, runReport)
           : await translateHTML(target, { ...config }, signal, ui.setStatus, force);
+        if (signal.aborted || activeRoot !== jobRoot) {
+          result.dispose(); result = null;
+          throw abortError();
+        }
         chinese = true;
-        ui.setStatus(`中文题面已显示，可随时查看原文。${target.kind === 'pdf' ? ' 请核对原页中的公式和图表。' : ''}`);
+        const ready = ui.host.getClientRects().length ? '中文题面已显示，可随时查看原文。' : '中文题面已就绪，返回题面标签即可查看。';
+        ui.setStatus(`${ready}${target.kind === 'pdf' ? ' 请核对原页中的公式和图表。' : ''}`);
       } catch (e) {
         const cancelled = signal.aborted || e.name === 'AbortError';
-        let message = cancelled ? '已取消，未应用未完成的译文。' : e.message || '翻译失败，请重试。';
+        const replaced = jobRoot && activeRoot !== jobRoot;
+        let message = replaced ? '题面区域已变化，已停止旧任务，请返回题面重新翻译。'
+          : cancelled ? '已取消，未应用未完成的译文。' : e.message || '翻译失败，请重试。';
         if (runReport) {
-          resumable = true;
+          resumable = !replaced;
           runReport.status = cancelled ? 'cancelled' : 'failed';
           runReport.errorCode = e.code || (cancelled ? 'CANCELLED' : 'PDF_ERROR');
           runReport.errorMessage = redactDiagnostic(message, config.apiKey);
