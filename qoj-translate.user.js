@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         QOJ 中文题面 · Responses API
 // @namespace    qoj-translate
-// @version      0.3.0
-// @description  HTML 原位翻译、PDF 中文阅读版，保留原文并随时切换；支持 Proxy Responses API。
+// @version      0.3.1
+// @description  HTML 原位翻译、PDF 中文阅读版，保留原文并随时切换；兼容 OpenAI Responses API。
 // @match        https://qoj.ac/problem/*
 // @match        https://qoj.ac/contest/*/problem/*
 // @run-at       document-idle
@@ -10,7 +10,6 @@
 // @grant        GM_setValue
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getResourceText
-// @connect      cpa.072899.xyz
 // @connect      qoj.ac
 // @connect      *
 // @resource     pdfjsModule https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.min.mjs
@@ -30,8 +29,8 @@
   const FORMAT_KEY = 'qoj-translator-format-v1';
   const FORMAT_TTL = 7 * 24 * 60 * 60 * 1000;
   const DEFAULTS = Object.freeze({
-    endpoint: 'https://cpa.072899.xyz/v1/responses',
-    model: 'gemini-3.8-flash-high',
+    endpoint: '',
+    model: '',
     apiKey: '',
     batchChars: 8000,
     timeoutSeconds: 180,
@@ -85,6 +84,7 @@ A page may start/end mid-sentence: translate that fragment without adding missin
   function abortError() { return new DOMException('操作已取消', 'AbortError'); }
   function checkAbort(signal) { if (signal?.aborted) throw abortError(); }
   function checkConfig(config) {
+    if (!config.endpoint.trim()) throw new Error('请填写完整的 Responses API 地址。');
     let url;
     try { url = new URL(config.endpoint); } catch { throw new Error('API 地址不是有效 URL。'); }
     if (url.protocol !== 'https:' || url.username || url.password || url.hash) {
@@ -500,7 +500,7 @@ A page may start/end mid-sentence: translate that fragment without adding missin
   }
   function createPDFDiagnostic(config, pageURL) {
     const endpoint = new URL(config.endpoint), page = new URL(pageURL);
-    return { scriptVersion: '0.3.0', createdAt: new Date().toISOString(),
+    return { scriptVersion: '0.3.1', createdAt: new Date().toISOString(),
       endpoint: redactDiagnostic(endpoint.origin + endpoint.pathname, config.apiKey),
       pageURL: page.origin + page.pathname, model: redactDiagnostic(config.model, config.apiKey),
       pdfImages: config.pdfImages, maxOutputTokens: config.pdfOutputTokens, autoRepair: config.pdfAutoRepair,
@@ -761,7 +761,7 @@ A page may start/end mid-sentence: translate that fragment without adding missin
     const chinese = element(document, 'button', '中文', { type: 'button', 'aria-label': '查看中文', 'aria-pressed': 'false', disabled: '', title: '请先翻译题面' });
     languages.append(original, chinese);
     const statusGroup = element(document, 'div', null, { class: 'status-group' });
-    const status = element(document, 'span', '请先设置 API Key', { class: 'status', role: 'status', 'aria-live': 'polite', 'aria-atomic': 'true' });
+    const status = element(document, 'span', '请先配置 API', { class: 'status', role: 'status', 'aria-live': 'polite', 'aria-atomic': 'true' });
     const info = element(document, 'button', 'ⓘ', { type: 'button', class: 'info', 'aria-label': '状态详情', 'aria-expanded': 'false', 'aria-controls': 'status-detail', title: '查看完整状态信息' });
     statusGroup.append(element(document, 'span', null, { class: 'dot', 'aria-hidden': 'true' }), status, info);
     const actions = element(document, 'div', null, { class: 'actions' });
@@ -805,6 +805,8 @@ A page may start/end mid-sentence: translate that fragment without adding missin
     function addField(container, [name, title, type]) {
       const label = element(document, 'label', type === 'checkbox' ? '' : title);
       const input = element(document, 'input', null, { type, name, autocomplete: 'off' });
+      if (name === 'endpoint') input.placeholder = 'https://api.example.com/v1/responses';
+      if (name === 'model') input.placeholder = '服务商提供的模型 ID';
       if (type === 'checkbox') label.append(input, document.createTextNode(` ${title}`));
       else label.append(input);
       container.append(label);
@@ -890,7 +892,7 @@ A page may start/end mid-sentence: translate that fragment without adding missin
       fill(currentConfig());
       formError.hidden = true;
       dialog.showModal();
-      (inputs.apiKey.value ? inputs.endpoint : inputs.apiKey).focus();
+      ([inputs.endpoint, inputs.model, inputs.apiKey].find(input => !input.value) || inputs.endpoint).focus();
     };
     const closeSettings = () => dialog.close();
     settings.onclick = openSettings;
@@ -933,7 +935,7 @@ A page may start/end mid-sentence: translate that fragment without adding missin
     const getConfig = () => Object.fromEntries(Object.entries(inputs).map(([key, input]) => [key,
       input.type === 'checkbox' ? input.checked : input.type === 'number' ? Number(input.value) : input.value.trim(),
     ]));
-    setStatus('请先设置 API Key。仅在点击翻译时向 API 发送题面，PDF 默认还会发送页图。');
+    setStatus('请先配置 API 地址、模型和密钥。仅在点击翻译时发送题面，PDF 默认还会发送页图。');
     return {
       host, translate, original, chinese, retranslate, cancel, settings, form, save, clear, diagnostic, resetFormat,
       setStatus, setFormError, setState, fill, getConfig, openSettings, closeSettings, closeMore, mount,

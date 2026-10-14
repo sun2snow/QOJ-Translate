@@ -1,4 +1,15 @@
 node_modules/
 *.log
 .DS_Store
-test-results/
+
+# Local verification tooling and artifacts; no build step is needed to install.
+/tests/
+/test-results/
+/coverage/
+/package.json
+/package-lock.json
+
+# Local configuration and diagnostics.
+.env*
+*.local.json
+/qoj-pdf-diagnostic*.json
