@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         QOJ 中文题面 · Responses API
 // @namespace    qoj-translate
-// @version      0.1.0
+// @version      0.2.0
 // @description  HTML 原位翻译、PDF 中文阅读版，保留原文并随时切换；支持 Proxy Responses API。
 // @match        https://qoj.ac/problem/*
 // @match        https://qoj.ac/contest/*/problem/*
@@ -132,7 +132,7 @@ A page may start/end mid-sentence: translate that fragment without adding missin
       if (!block || !root.contains(block)) block = parent;
       // Context is plain text; never send source HTML, event handlers, or hidden scripts.
       const contextClone = block.cloneNode(true);
-      contextClone.querySelectorAll('script,style,noscript,[hidden],[aria-hidden="true"]').forEach(el => el.remove());
+      contextClone.querySelectorAll('script,style,noscript,[hidden],[aria-hidden="true"],[data-qoj-translator]').forEach(el => el.remove());
       const context = contextClone.textContent.trim().slice(0, 2200);
       const id = `t${records.length}`;
       const parts = splitText(masked.masked);
@@ -329,10 +329,10 @@ A page may start/end mid-sentence: translate that fragment without adding missin
     }
     return null;
   }
-  function detectStatement(doc, locationHref, config) {
+  function findStatementRoot(doc, selector = '') {
     let root;
-    if (config.selector.trim()) {
-      try { root = doc.querySelector(config.selector.trim()); } catch { throw new Error('自定义题面 CSS 选择器无效。'); }
+    if (selector.trim()) {
+      try { root = doc.querySelector(selector.trim()); } catch { throw new Error('自定义题面 CSS 选择器无效。'); }
       if (!root) throw new Error('自定义题面选择器没有匹配元素。');
     } else {
       const selectors = [
@@ -348,9 +348,13 @@ A page may start/end mid-sentence: translate that fragment without adding missin
         }
       }
     }
-    if (!root || root === doc.body || root === doc.documentElement || root.querySelector('[data-qoj-translator="toolbar"]')) {
+    if (!root || root === doc.body || root === doc.documentElement || root.closest('[data-qoj-translator]')) {
       throw new Error('未识别到安全的题面区域。请切到题面标签，或在设置中填写题面 CSS 选择器。');
     }
+    return root;
+  }
+  function detectStatement(doc, locationHref, config) {
+    const root = findStatementRoot(doc, config.selector);
     let pdfURL = null;
     if (config.pdfURL.trim()) {
       const url = new URL(config.pdfURL.trim(), locationHref);
@@ -473,40 +477,85 @@ A page may start/end mid-sentence: translate that fragment without adding missin
   };
   if (typeof module === 'object' && module.exports) { module.exports = exportsForTests; return; }
 
-  function createUI() {
-    const host = element(document, 'div', null, { 'data-qoj-translator': 'toolbar' });
-    host.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:2147483646;color-scheme:light;';
+  function createUI(currentConfig) {
+    const host = element(document, 'div', null, { 'data-qoj-translator': 'toolbar', translate: 'no' });
+    // The toolbar is a sibling of the statement, never a fixed overlay or part
+    // of the source that gets translated/hidden when switching PDF views.
+    host.style.cssText = 'display:block;position:static;float:none;clear:both;max-width:100%;margin:12px 0 16px;color-scheme:light;';
     const shadow = host.attachShadow({ mode: 'closed' });
-    const style = element(document, 'style', `
-      :host{all:initial;font:14px/1.55 system-ui,sans-serif;color:#172033}
-      *{box-sizing:border-box}button,input{font:inherit}
-      .panel{width:340px;max-width:calc(100vw - 32px);padding:14px;background:#fff;border:1px solid #d3dae5;border-radius:12px;box-shadow:0 6px 30px #0003}
-      .row{display:flex;gap:7px;align-items:center;flex-wrap:wrap;margin:7px 0}
-      strong{flex:1}button{border:1px solid #b8c4d8;background:#f3f6fa;border-radius:6px;padding:6px 10px;cursor:pointer;color:#172033}
-      button.primary{background:#245dde;color:white;border-color:#245dde}button:disabled{opacity:.5;cursor:default}
-      .status{white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px;color:#42506a;margin-top:8px;max-height:140px;overflow:auto}
-      .error{color:#ae182b}.small{font-size:12px;color:#54637a}label{display:block;margin:9px 0}
-      input:not([type=checkbox]){display:block;width:100%;padding:6px;border:1px solid #b8c4d8;border-radius:5px;color:#172033;background:white}
-      form{max-height:65vh;overflow:auto;border-top:1px solid #ddd;margin-top:8px;padding-top:6px}
-      input[type=checkbox]{vertical-align:middle}summary{cursor:pointer;margin-top:8px}
-      [hidden]{display:none!important}.mini .body{display:none}
-    `);
-    shadow.append(style);
-    const panel = element(document, 'section', null, { class: 'panel', 'aria-label': 'QOJ 中文题面翻译' });
-    const top = element(document, 'div', null, { class: 'row' });
-    top.append(element(document, 'strong', 'QOJ 中文题面'));
-    const minimize = element(document, 'button', '收起', { type: 'button' });
-    top.append(minimize);
-    const body = element(document, 'div', null, { class: 'body' });
-    const actions = element(document, 'div', null, { class: 'row' });
+    shadow.append(element(document, 'style', `
+      :host{all:initial;display:block;container-type:inline-size;font:13px/1.5 system-ui,sans-serif;color:#263448;color-scheme:light}
+      *{box-sizing:border-box}button,input{font:inherit}button{cursor:pointer;white-space:nowrap}
+      button{min-height:30px;padding:4px 10px;border:1px solid transparent;border-radius:5px;background:transparent;color:#526076}
+      button:hover:not(:disabled){background:#eef3f9;color:#244e93}button:disabled{opacity:.45;cursor:default}
+      button:focus-visible,summary:focus-visible,input:focus-visible{outline:2px solid #3975cc;outline-offset:2px}
+      button.primary{background:#326bb5;border-color:#326bb5;color:#fff}button.primary:hover:not(:disabled){background:#285a9c;color:#fff}
+      button.outline{border-color:#d7dee8;background:#fff}.icon{width:30px;padding:0;font-size:18px;line-height:1}
+      .shell{border:1px solid #e0e5ed;border-radius:8px;background:#fff}
+      .bar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;min-height:46px;padding:7px 10px}
+      .languages{display:flex;flex:none;padding:2px;border-radius:6px;background:#f1f4f8;gap:2px}
+      .languages button{min-height:26px;min-width:48px;padding:2px 10px}
+      .languages button[aria-pressed=true]{background:#fff;color:#245da5;box-shadow:0 1px 3px #17203314;font-weight:600}
+      .status-group{display:flex;flex:1 1 120px;align-items:center;gap:7px;min-width:0;color:#758196}
+      .dot{width:6px;height:6px;border-radius:50%;background:#a4afbe;flex:none}
+      .busy .dot{background:#3975cc;animation:pulse 1.2s ease-in-out infinite}.error .dot{background:#b33b46}
+      .status{overflow:hidden;white-space:nowrap;text-overflow:ellipsis;min-width:0;font-size:12px}
+      .error .status{color:#a52c3a}.info{padding:0;min-height:24px;min-width:24px;font-size:12px;flex:none}
+      .actions{display:flex;align-items:center;gap:5px;margin-left:auto;flex:none}
+      .overflow-actions{display:flex;justify-content:flex-end;gap:6px;flex-wrap:wrap;padding:7px 10px;border-top:1px solid #edf0f5;background:#fafbfd;border-radius:0 0 8px 8px}
+      .status-detail{margin:0;padding:10px 12px;border-top:1px solid #edf0f5;white-space:pre-wrap;overflow-wrap:anywhere;max-height:160px;overflow:auto;font-size:12px;color:#5d6a7d}
+      .status-detail.error{color:#a52c3a;background:#fff8f8}
+      dialog{position:fixed;inset:0;margin:auto;width:520px;max-width:calc(100vw - 32px);max-height:calc(100dvh - 40px);padding:0;border:1px solid #dbe2ec;border-radius:12px;background:#fff;color:#263448;box-shadow:0 18px 60px #14203733;overflow:auto;font:14px/1.6 system-ui,sans-serif}
+      dialog::backdrop{background:#17203355}
+      .dialog-head{display:flex;align-items:flex-start;gap:16px;padding:20px 22px 12px}.dialog-head>div{flex:1}
+      h2{margin:0 0 3px;font-size:18px;font-weight:600}.small{font-size:12px;color:#758196}
+      form{padding:0 22px 20px}label{display:block;margin:12px 0;color:#526076;font-size:13px}
+      input:not([type=checkbox]){display:block;width:100%;margin-top:5px;padding:8px 10px;border:1px solid #d6deea;border-radius:6px;background:#fff;color:#263448}
+      input[type=checkbox]{vertical-align:middle;accent-color:#326bb5}summary{cursor:pointer;color:#526076}
+      .advanced{margin:18px 0;padding:12px;border:1px solid #e4e9f0;border-radius:6px}
+      .privacy{padding:10px 12px;background:#f6f8fb;border-radius:6px}
+      .form-error{margin:10px 0;padding:10px;border-radius:6px;background:#fff1f1;color:#a52c3a;overflow-wrap:anywhere}
+      .form-controls{display:flex;justify-content:flex-end;gap:8px;margin-top:18px}
+      [hidden]{display:none!important}
+      @container (max-width:560px){.bar{gap:8px}.status-group{order:3;flex-basis:100%}.actions{gap:3px}.bar{padding:7px 8px}}
+      @media (max-width:380px){dialog{max-width:calc(100vw - 16px)}.dialog-head{padding:16px 16px 10px}form{padding:0 16px 16px}}
+      @keyframes pulse{50%{opacity:.35}}@media (prefers-reduced-motion:reduce){.busy .dot{animation:none}}
+    `));
+    const shell = element(document, 'section', null, { class: 'shell', 'aria-label': 'QOJ 中文题面翻译' });
+    const bar = element(document, 'div', null, { class: 'bar' });
+    const languages = element(document, 'div', null, { class: 'languages', role: 'group', 'aria-label': '题面语言' });
+    const original = element(document, 'button', '原文', { type: 'button', 'aria-label': '查看原文', 'aria-pressed': 'true' });
+    const chinese = element(document, 'button', '中文', { type: 'button', 'aria-label': '查看中文', 'aria-pressed': 'false', disabled: '', title: '请先翻译题面' });
+    languages.append(original, chinese);
+    const statusGroup = element(document, 'div', null, { class: 'status-group' });
+    const status = element(document, 'span', '请先设置 API Key', { class: 'status', role: 'status', 'aria-live': 'polite', 'aria-atomic': 'true' });
+    const info = element(document, 'button', 'ⓘ', { type: 'button', class: 'info', 'aria-label': '状态详情', 'aria-expanded': 'false', 'aria-controls': 'status-detail', title: '查看完整状态信息' });
+    statusGroup.append(element(document, 'span', null, { class: 'dot', 'aria-hidden': 'true' }), status, info);
+    const actions = element(document, 'div', null, { class: 'actions' });
     const translate = element(document, 'button', '翻译为中文', { type: 'button', class: 'primary' });
-    const toggle = element(document, 'button', '查看原文', { type: 'button', disabled: '' });
-    const cancel = element(document, 'button', '取消', { type: 'button', hidden: '' });
-    const settings = element(document, 'button', '设置', { type: 'button' });
-    actions.append(translate, toggle, cancel, settings);
-    const status = element(document, 'div', '点击翻译才会向你配置的 API 发送题面。请先设置 API Key。', { class: 'status', role: 'status', 'aria-live': 'polite' });
-    body.append(actions, status);
-    const form = element(document, 'form', null, { hidden: '' });
+    const cancel = element(document, 'button', '取消', { type: 'button', class: 'outline', hidden: '' });
+    const settings = element(document, 'button', '⚙', { type: 'button', class: 'icon', 'aria-label': '设置', title: '翻译设置', 'aria-haspopup': 'dialog' });
+    const more = element(document, 'button', '⋯', { type: 'button', class: 'icon', 'aria-label': '更多操作', 'aria-expanded': 'false', 'aria-controls': 'overflow-actions', title: '更多操作' });
+    actions.append(translate, cancel, settings, more);
+    bar.append(languages, statusGroup, actions);
+    const overflow = element(document, 'div', null, { id: 'overflow-actions', class: 'overflow-actions', role: 'group', 'aria-label': '更多操作', hidden: '' });
+    const retranslate = element(document, 'button', '重新翻译', { type: 'button', disabled: '' });
+    const clear = element(document, 'button', '清除译文缓存', { type: 'button' });
+    overflow.append(retranslate, clear);
+    const detail = element(document, 'div', null, { id: 'status-detail', class: 'status-detail', hidden: '' });
+    shell.append(bar, overflow, detail);
+    shadow.append(shell);
+
+    // Native modal dialog provides a top layer, background inertness, Escape
+    // dismissal and focus restoration; the normal reading layout never overlays.
+    const dialog = element(document, 'dialog', null, { 'aria-labelledby': 'settings-title', 'aria-describedby': 'settings-description' });
+    const header = element(document, 'div', null, { class: 'dialog-head' });
+    const heading = element(document, 'div');
+    heading.append(element(document, 'h2', '翻译设置', { id: 'settings-title' }),
+      element(document, 'div', '仅在点击翻译时发送题面；PDF 可选发送页图。', { class: 'small', id: 'settings-description' }));
+    const close = element(document, 'button', '×', { type: 'button', class: 'icon', 'aria-label': '关闭设置', title: '关闭（Esc）' });
+    header.append(heading, close);
+    const form = element(document, 'form');
     const inputs = {};
     const fields = [
       ['endpoint', 'Responses API 完整地址', 'url'],
@@ -519,41 +568,136 @@ A page may start/end mid-sentence: translate that fragment without adding missin
     function addField(container, [name, title, type]) {
       const label = element(document, 'label', type === 'checkbox' ? '' : title);
       const input = element(document, 'input', null, { type, name, autocomplete: 'off' });
-      if (type === 'checkbox') { label.append(input, document.createTextNode(` ${title}`)); }
+      if (type === 'checkbox') label.append(input, document.createTextNode(` ${title}`));
       else label.append(input);
       container.append(label);
       inputs[name] = input;
     }
     fields.forEach(field => addField(form, field));
-    const advanced = element(document, 'details');
-    advanced.append(element(document, 'summary', '题面识别不正确？（高级设置）'));
+    const advanced = element(document, 'details', null, { class: 'advanced' });
+    advanced.append(element(document, 'summary', '高级设置 · 题面识别'));
     addField(advanced, ['selector', '题面 CSS 选择器（留空自动识别）', 'text']);
     addField(advanced, ['pdfURL', '当前题目 PDF 下载 URL（留空自动识别）', 'text']);
     advanced.append(element(document, 'div', '高级设置只保留在当前页面，不会套用到其他题目。', { class: 'small' }));
     form.append(advanced);
-    form.append(element(document, 'div', '密钥和缓存由 Tampermonkey 明文存储。题面/页图仅发往所配置 API；代理是否留存由其政策决定。', { class: 'small' }));
-    const controls = element(document, 'div', null, { class: 'row' });
-    const save = element(document, 'button', '保存设置', { type: 'submit' });
-    const clear = element(document, 'button', '清除译文缓存', { type: 'button' });
-    controls.append(save, clear);
-    form.append(controls);
-    body.append(form);
-    panel.append(top, body);
-    shadow.append(panel);
-    document.body.append(host);
-    minimize.onclick = () => { panel.classList.toggle('mini'); minimize.textContent = panel.classList.contains('mini') ? '展开' : '收起'; };
-    settings.onclick = () => { form.hidden = !form.hidden; };
-    const setStatus = (text, error = false) => { status.textContent = text; status.classList.toggle('error', error); };
+    form.append(element(document, 'div', '密钥和缓存由 Tampermonkey 明文存储。题面/页图仅发往所配置 API；代理是否留存由其政策决定。', { class: 'small privacy' }));
+    const formError = element(document, 'div', null, { class: 'form-error', role: 'alert', hidden: '' });
+    const controls = element(document, 'div', null, { class: 'form-controls' });
+    const dismiss = element(document, 'button', '取消', { type: 'button', class: 'outline' });
+    const save = element(document, 'button', '保存设置', { type: 'submit', class: 'primary' });
+    controls.append(dismiss, save);
+    form.append(formError, controls);
+    dialog.append(header, form);
+    shadow.append(dialog);
+
+    function mount(root) {
+      // Do not relocate an open native dialog, which would close its top layer.
+      if (dialog.open) return;
+      if (!root) {
+        try { root = findStatementRoot(document, currentConfig().selector); } catch { /* Keep settings reachable even if detection fails. */ }
+      }
+      let anchor = root || document.querySelector('main,.uoj-content,.container');
+      // The PDF reading edition is inserted immediately before the source.
+      // Always stay above BOTH editions when the MutationObserver runs.
+      if (root?.previousElementSibling?.matches('[data-qoj-translator="pdf"]')) anchor = root.previousElementSibling;
+      if (anchor && anchor !== host && !host.contains(anchor)) {
+        if (anchor.previousElementSibling !== host) anchor.before(host);
+      } else if (document.body.firstElementChild !== host) document.body.prepend(host);
+    }
+    mount();
+    let queued = false;
+    const observer = new MutationObserver(() => {
+      if (queued) return;
+      queued = true;
+      queueMicrotask(() => { queued = false; mount(); });
+    });
+    // Also support statements inserted asynchronously or replaced by the site.
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    const closeMore = (restoreFocus = false) => {
+      overflow.hidden = true;
+      more.setAttribute('aria-expanded', 'false');
+      if (restoreFocus) more.focus();
+    };
+    more.onclick = () => {
+      const open = overflow.hidden;
+      overflow.hidden = !open;
+      more.setAttribute('aria-expanded', String(open));
+    };
+    document.addEventListener('pointerdown', event => {
+      if (!event.composedPath().includes(host)) closeMore();
+    });
+    shadow.addEventListener('click', event => {
+      if (!event.composedPath().includes(overflow) && event.target !== more) closeMore();
+    });
+    shadow.addEventListener('keydown', event => {
+      if (event.key === 'Escape' && !overflow.hidden && !dialog.open) {
+        closeMore(true);
+        event.preventDefault();
+        event.stopPropagation();
+      }
+    });
+    info.onclick = () => {
+      detail.hidden = !detail.hidden;
+      info.setAttribute('aria-expanded', String(!detail.hidden));
+    };
     const fill = config => {
       for (const [name, input] of Object.entries(inputs)) {
         if (input.type === 'checkbox') input.checked = config[name];
         else input.value = config[name];
       }
     };
+    const openSettings = () => {
+      if (dialog.open) return;
+      closeMore();
+      fill(currentConfig());
+      formError.hidden = true;
+      dialog.showModal();
+      (inputs.apiKey.value ? inputs.endpoint : inputs.apiKey).focus();
+    };
+    const closeSettings = () => dialog.close();
+    settings.onclick = openSettings;
+    close.onclick = dismiss.onclick = closeSettings;
+    dialog.addEventListener('close', () => { formError.hidden = true; mount(); });
+    dialog.addEventListener('click', event => {
+      if (event.target !== dialog) return;
+      const rect = dialog.getBoundingClientRect();
+      if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) closeSettings();
+    });
+    const setStatus = (text, error = false) => {
+      status.textContent = text;
+      status.title = text;
+      detail.textContent = text;
+      statusGroup.classList.toggle('error', error);
+      detail.classList.toggle('error', error);
+      if (error) { detail.hidden = false; info.setAttribute('aria-expanded', 'true'); }
+    };
+    const setFormError = text => { formError.textContent = text; formError.hidden = !text; };
+    const setState = (busy, hasResult, showingChinese) => {
+      const actionHadFocus = [translate, cancel, retranslate].includes(shadow.activeElement);
+      translate.disabled = busy;
+      translate.hidden = hasResult || busy;
+      retranslate.disabled = busy || !hasResult;
+      original.disabled = busy;
+      chinese.disabled = busy || !hasResult;
+      chinese.title = hasResult ? '显示中文译文（不调用 API）' : '请先翻译题面';
+      original.setAttribute('aria-pressed', String(!showingChinese));
+      chinese.setAttribute('aria-pressed', String(showingChinese));
+      cancel.hidden = !busy;
+      save.disabled = busy;
+      clear.disabled = busy;
+      statusGroup.classList.toggle('busy', busy);
+      if (busy) { detail.hidden = true; info.setAttribute('aria-expanded', 'false'); closeMore(); }
+      if (actionHadFocus) (busy ? cancel : hasResult ? (showingChinese ? chinese : original) : translate).focus();
+    };
     const getConfig = () => Object.fromEntries(Object.entries(inputs).map(([key, input]) => [key,
       input.type === 'checkbox' ? input.checked : input.type === 'number' ? Number(input.value) : input.value.trim(),
     ]));
-    return { host, translate, toggle, cancel, settings, form, save, clear, setStatus, fill, getConfig };
+    setStatus('请先设置 API Key。仅在点击翻译时向 API 发送题面，PDF 默认还会发送页图。');
+    return {
+      host, translate, original, chinese, retranslate, cancel, settings, form, save, clear,
+      setStatus, setFormError, setState, fill, getConfig, openSettings, closeSettings, closeMore, mount,
+    };
   }
 
   async function translateHTML(target, config, signal, notify, force) {
@@ -788,20 +932,12 @@ A page may start/end mid-sentence: translate that fragment without adding missin
     if (document.querySelector('[data-qoj-translator="toolbar"]')) return;
     const stored = GM_getValue(CONFIG_KEY, {});
     let config = { ...DEFAULTS, ...(stored && typeof stored === 'object' ? stored : {}), selector: '', pdfURL: '' };
-    const ui = createUI();
+    const ui = createUI(() => config);
     ui.fill(config);
-    if (config.apiKey) ui.setStatus(`已配置 ${config.model}。点击翻译才发送题面；PDF 默认还会发送页图。`);
+    if (config.apiKey) ui.setStatus('已就绪 · 点击翻译才发送题面；PDF 默认还会发送页图。');
     let controller = null, result = null, chinese = false;
-    const update = () => {
-      const busy = !!controller;
-      ui.translate.disabled = busy;
-      ui.toggle.disabled = busy || !result;
-      ui.cancel.hidden = !busy;
-      ui.save.disabled = busy;
-      ui.clear.disabled = busy;
-      ui.translate.textContent = result ? '重新翻译' : '翻译为中文';
-      ui.toggle.textContent = chinese ? '查看原文' : '查看中文';
-    };
+    const update = () => ui.setState(!!controller, !!result, chinese);
+    update();
     ui.form.onsubmit = event => {
       event.preventDefault();
       if (controller) return;
@@ -810,27 +946,32 @@ A page may start/end mid-sentence: translate that fragment without adding missin
         const { selector, pdfURL, ...persistent } = next;
         GM_setValue(CONFIG_KEY, persistent);
         config = next;
-        ui.form.hidden = true;
-        ui.setStatus('设置已保存。密钥不会写入页面内容或日志。');
-      } catch (e) { ui.setStatus(e.message, true); }
+        ui.closeSettings();
+        ui.mount();
+        ui.setStatus('设置已保存 · 点击翻译开始');
+      } catch (e) { ui.setFormError(e.message); }
     };
     ui.clear.onclick = () => {
       if (controller) return;
       GM_setValue(CACHE_KEY, {});
+      ui.closeMore(true);
       ui.setStatus('译文缓存已清除。当前已显示的译文仍可切换；重新翻译将调用 API。');
     };
     ui.cancel.onclick = () => { controller?.abort(); ui.setStatus('正在取消…'); };
-    ui.toggle.onclick = () => {
+    const showLanguage = next => {
+      if (controller || !result || chinese === next) return;
       try {
-        result.show(!chinese);
-        chinese = !chinese;
+        result.show(next);
+        chinese = next;
         ui.setStatus(chinese ? '当前显示中文题面。' : '当前显示原文。');
       } catch (e) { ui.setStatus(e.message, true); }
       update();
     };
-    ui.translate.onclick = async () => {
+    ui.original.onclick = () => showLanguage(false);
+    ui.chinese.onclick = () => showLanguage(true);
+    const startTranslation = async () => {
       if (controller) return;
-      try { checkConfig(config); } catch (e) { ui.form.hidden = false; ui.setStatus(e.message, true); return; }
+      try { checkConfig(config); } catch (e) { ui.openSettings(); ui.setFormError(e.message); return; }
       const force = !!result;
       if (force && !window.confirm('重新翻译会绕过本题缓存并再次调用 API，可能产生费用。继续吗？')) return;
       // Roll back before collecting a new source snapshot: never translate Chinese into Chinese.
@@ -840,6 +981,7 @@ A page may start/end mid-sentence: translate that fragment without adding missin
       update();
       try {
         const target = detectStatement(document, location.href, config);
+        ui.mount(target.root);
         ui.setStatus(`已识别 ${target.kind.toUpperCase()} 题面。准备翻译…`);
         result = target.kind === 'pdf'
           ? await translatePDF(target, { ...config }, signal, ui.setStatus, force)
@@ -850,6 +992,8 @@ A page may start/end mid-sentence: translate that fragment without adding missin
         ui.setStatus(signal.aborted || e.name === 'AbortError' ? '已取消，未应用未完成的译文。' : e.message || '翻译失败，请重试。', !signal.aborted);
       } finally { controller = null; update(); }
     };
+    ui.translate.onclick = startTranslation;
+    ui.retranslate.onclick = () => { ui.closeMore(true); return startTranslation(); };
     window.addEventListener('pagehide', () => controller?.abort());
   }
 

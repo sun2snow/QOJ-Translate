@@ -1,6 +1,6 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { readFileSync, existsSync } = require('node:fs');
+const { readFileSync, existsSync, mkdirSync } = require('node:fs');
 const path = require('node:path');
 const { chromium } = require('playwright-core');
 
@@ -14,14 +14,21 @@ const resource = {
 };
 const pdfBytes = readFileSync(path.join(__dirname, 'fixtures/statement.pdf'));
 const pdfBase64 = pdfBytes.toString('base64');
+const fixtureHeader = `<meta charset="utf-8"><style>
+  body{font:15px/1.6 Arial,sans-serif;color:#253247;margin:16px;background:#fff}
+  .container{max-width:1000px;margin:30px auto}h1{font-size:26px;margin:0 0 6px}.meta{color:#8992a2;font-size:13px;margin-bottom:24px}
+  article h2{font-size:19px}article pre{padding:16px;background:#f5f7fa;border-radius:6px}
+  iframe{width:100%;height:460px;border:1px solid #ddd}
+</style>`;
+const fixtureTitle = '<h1 class="fixture-title">J. Synthetic Statement</h1><div class="meta">Time limit: 1 second · Memory limit: 512 MB · Local test fixture</div>';
 const fixtures = {
-  html: `<!doctype html><meta charset="utf-8"><div class="container"><div id="tab-statement"><article>
+  html: `<!doctype html>${fixtureHeader}<div class="container">${fixtureTitle}<div id="tab-statement"><article>
   <h2>Input</h2><p>Given an integer $n$, print <code>Joker</code> or <code>Judger</code>.</p>
   <p>The answer is <strong>strictly greater</strong> than the limit.</p>
   <p>Compute <mjx-container>n + 1</mjx-container> and return the answer.</p>
   <pre>2\n3 10\nJoker</pre><img id="original-image" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10'%3E%3C/svg%3E">
   </article></div><button id="submit">Submit</button></div>`,
-  pdf: '<!doctype html><meta charset="utf-8"><div id="tab-statement"><article style="display: block !important"><iframe src="/download.php?contest_id=4576&id=22881&type=statement" title="PDF"></iframe></article></div>',
+  pdf: `<!doctype html>${fixtureHeader}<div class="container">${fixtureTitle}<div id="tab-statement"><article style="display: block !important"><iframe src="/download.php?contest_id=4576&id=22881&type=statement" title="PDF"></iframe></article></div></div>`,
 };
 
 async function setup(t, kind) {
@@ -128,6 +135,8 @@ test('Chrome: API failure and cancellation leave original HTML intact', options,
   await page.evaluate(() => { window.__mode = 'http-error'; });
   await toolbar.getByRole('button', { name: '翻译为中文', exact: true }).click();
   await toolbar.locator('.status').filter({ hasText: 'HTTP 400' }).waitFor();
+  assert.equal(await toolbar.locator('.status-detail').isVisible(), true);
+  assert.ok((await toolbar.boundingBox()).y + (await toolbar.boundingBox()).height <= (await page.locator('article').boundingBox()).y);
   assert.equal(await page.locator('article').innerHTML(), before);
   await page.evaluate(() => { window.__mode = 'hang'; });
   await toolbar.getByRole('button', { name: '翻译为中文', exact: true }).click();
@@ -153,6 +162,9 @@ test('Chrome: real PDF.js ESM renders a PDF, crops originals, typesets math and 
   assert.equal(await reader.locator('.katex').count(), 1);
   assert.ok(await reader.locator('figure img').evaluate(img => img.naturalWidth > 100));
   assert.equal(await original.evaluate(el => getComputedStyle(el).display), 'none');
+  assert.equal(await toolbar.isVisible(), true);
+  assert.ok((await toolbar.boundingBox()).y + (await toolbar.boundingBox()).height <= (await reader.boundingBox()).y);
+  assert.equal(await reader.evaluate(el => el.previousElementSibling?.dataset.qojTranslator), 'toolbar');
   const requests = await page.evaluate(() => window.__requests);
   assert.equal(requests.length, 1);
   assert.equal(requests[0].input[0].content[1].type, 'input_image');
@@ -182,5 +194,151 @@ test('Chrome: text-only PDF mode sends no image and expands full original page',
   assert.equal(await reader.locator('details').getAttribute('open'), '');
   assert.equal(await reader.locator('pre').textContent(), '3 10\nJoker');
   assert.equal(await page.evaluate(() => window.__requests[0].input[0].content.length), 1);
+  assert.deepEqual(errors, []);
+});
+
+test('Chrome: inline toolbar sits below metadata, never covers text, and scrolls with the page', options, async t => {
+  const { page, toolbar, errors } = await setup(t, 'html');
+  const bar = await toolbar.boundingBox();
+  const metadata = await page.locator('.meta').boundingBox();
+  const statement = await page.locator('article').boundingBox();
+  assert.ok(bar.y >= metadata.y + metadata.height);
+  assert.ok(bar.y + bar.height <= statement.y);
+  assert.ok(bar.height <= 60, `Desktop bar should stay compact: ${bar.height}`);
+  assert.equal(await toolbar.evaluate(el => getComputedStyle(el).position), 'static');
+  assert.equal(await page.locator('article').evaluate(el => el.previousElementSibling?.dataset.qojTranslator), 'toolbar');
+  assert.equal(await toolbar.getByRole('button', { name: '查看原文' }).getAttribute('aria-pressed'), 'true');
+  assert.equal(await toolbar.getByRole('button', { name: '查看中文' }).isDisabled(), true);
+  assert.equal(await toolbar.locator('dialog').isVisible(), false);
+  if (process.env.UI_SCREENSHOTS) {
+    mkdirSync(path.join(ROOT, 'test-results'), { recursive: true });
+    await page.screenshot({ path: path.join(ROOT, 'test-results/ui-desktop.png'), fullPage: true });
+  }
+  await page.evaluate(() => { document.body.style.minHeight = '2200px'; window.scrollTo(0, 500); });
+  assert.ok((await toolbar.boundingBox()).y < 0, 'Toolbar must not stick to the viewport');
+  assert.deepEqual(errors, []);
+});
+
+test('Chrome: toolbar and settings fit narrow screens without horizontal overflow', options, async t => {
+  const { page, toolbar, errors } = await setup(t, 'html');
+  for (const width of [320, 375, 768, 1280]) {
+    await page.setViewportSize({ width, height: 720 });
+    const bar = await toolbar.boundingBox();
+    const article = await page.locator('article').boundingBox();
+    assert.ok(bar.x >= 0 && bar.x + bar.width <= width, `Toolbar outside ${width}px viewport`);
+    assert.ok(bar.y + bar.height <= article.y);
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+    for (const name of ['查看原文', '查看中文', '翻译为中文', '设置', '更多操作']) {
+      const box = await toolbar.getByRole('button', { name, exact: true }).boundingBox();
+      assert.ok(box.x >= bar.x && box.x + box.width <= bar.x + bar.width + 1, `${name} overflows at ${width}px`);
+    }
+    await toolbar.getByRole('button', { name: '设置', exact: true }).click();
+    const modal = await toolbar.locator('dialog').boundingBox();
+    assert.ok(modal.x >= 0 && modal.x + modal.width <= width);
+    assert.ok(modal.y >= 0 && modal.y + modal.height <= 720);
+    await page.keyboard.press('Escape');
+  }
+  if (process.env.UI_SCREENSHOTS) {
+    await page.setViewportSize({ width: 375, height: 812 });
+    mkdirSync(path.join(ROOT, 'test-results'), { recursive: true });
+    await page.screenshot({ path: path.join(ROOT, 'test-results/ui-mobile.png'), fullPage: true });
+  }
+  assert.deepEqual(errors, []);
+});
+
+test('Chrome: settings dialog validates visibly, restores focus, and discards unsaved drafts', options, async t => {
+  const { page, toolbar, errors } = await setup(t, 'html');
+  const settings = toolbar.getByRole('button', { name: '设置', exact: true });
+  await settings.click();
+  const modal = toolbar.getByRole('dialog', { name: '翻译设置' });
+  assert.equal(await modal.isVisible(), true);
+  await toolbar.locator('input[name="apiKey"]').fill('');
+  await toolbar.getByRole('button', { name: '保存设置', exact: true }).click();
+  assert.match(await toolbar.locator('.form-error').textContent(), /API Key/);
+  assert.equal(await toolbar.locator('.form-error').isVisible(), true);
+  assert.equal(await modal.isVisible(), true);
+  await page.keyboard.press('Escape');
+  assert.equal(await modal.isVisible(), false);
+  assert.equal(await settings.evaluate(el => el.getRootNode().activeElement === el), true);
+  await settings.click();
+  assert.equal(await toolbar.locator('input[name="apiKey"]').inputValue(), 'synthetic-test-key');
+  for (let i = 0; i < 4; i++) {
+    await page.keyboard.press('Tab');
+    assert.equal(await toolbar.evaluate(el => !!el.shadowRoot.activeElement?.closest('dialog')), true);
+  }
+  if (process.env.UI_SCREENSHOTS) {
+    mkdirSync(path.join(ROOT, 'test-results'), { recursive: true });
+    await page.screenshot({ path: path.join(ROOT, 'test-results/ui-settings.png') });
+  }
+  await toolbar.getByRole('button', { name: '关闭设置', exact: true }).click();
+  assert.equal(await modal.isVisible(), false);
+  await settings.click();
+  await page.mouse.click(2, 2);
+  assert.equal(await modal.isVisible(), false);
+  assert.equal(await page.evaluate(() => window.__requests.length), 0);
+  assert.deepEqual(errors, []);
+});
+
+test('Chrome: more actions stay in flow; retranslation confirms charges and uses original text', options, async t => {
+  const { page, toolbar, completed, errors, install } = await setup(t, 'html');
+  const more = toolbar.getByRole('button', { name: '更多操作', exact: true });
+  await more.click();
+  assert.equal(await toolbar.getByRole('button', { name: '重新翻译', exact: true }).isDisabled(), true);
+  const expanded = await toolbar.boundingBox();
+  assert.ok(expanded.y + expanded.height <= (await page.locator('article').boundingBox()).y);
+  await page.keyboard.press('Escape');
+  assert.equal(await more.getAttribute('aria-expanded'), 'false');
+  await toolbar.getByRole('button', { name: '翻译为中文', exact: true }).click();
+  await completed();
+  assert.equal(await toolbar.getByRole('button', { name: '查看中文' }).getAttribute('aria-pressed'), 'true');
+  assert.equal(await toolbar.getByRole('button', { name: '翻译为中文', exact: true }).isVisible(), false);
+  await toolbar.getByRole('button', { name: '查看中文' }).click();
+  assert.equal(await page.evaluate(() => window.__requests.length), 1);
+  await more.click();
+  page.once('dialog', dialog => dialog.dismiss());
+  await toolbar.getByRole('button', { name: '重新翻译', exact: true }).click();
+  assert.equal(await page.evaluate(() => window.__requests.length), 1);
+  await more.click();
+  page.once('dialog', dialog => dialog.accept());
+  await toolbar.getByRole('button', { name: '重新翻译', exact: true }).click();
+  await completed();
+  assert.equal(await page.evaluate(() => window.__requests.length), 2);
+  const sent = await page.evaluate(() => JSON.parse(window.__requests[1].input[0].content[0].text).segments);
+  assert.ok(sent.every(s => !s.text.includes('中文：')));
+  await more.click();
+  await toolbar.getByRole('button', { name: '清除译文缓存', exact: true }).click();
+  assert.equal(await more.getAttribute('aria-expanded'), 'false');
+  assert.equal(await page.evaluate(() => window.__requests.length), 2);
+  await page.reload();
+  await install();
+  await toolbar.getByRole('button', { name: '翻译为中文', exact: true }).click();
+  await completed();
+  assert.equal(await page.evaluate(() => window.__requests.length), 1);
+  assert.deepEqual(errors, []);
+});
+
+test('Chrome: toolbar remounts after delayed statements and supports custom ancestor selectors', options, async t => {
+  const { page, toolbar, completed, errors } = await setup(t, 'html');
+  await page.evaluate(() => document.querySelector('#tab-statement').remove());
+  await toolbar.waitFor({ state: 'visible' });
+  assert.equal(await toolbar.getByRole('button', { name: '设置', exact: true }).isVisible(), true);
+  await page.evaluate(() => {
+    const tab = document.createElement('section');
+    tab.id = 'tab-statement';
+    const article = document.createElement('article');
+    article.textContent = 'This is a delayed synthetic statement with enough text to detect.';
+    tab.append(article);
+    document.querySelector('.container').append(tab);
+  });
+  await page.waitForFunction(() => document.querySelector('article').previousElementSibling?.dataset.qojTranslator === 'toolbar');
+  await toolbar.getByRole('button', { name: '设置', exact: true }).click();
+  await toolbar.locator('summary').click();
+  await toolbar.locator('input[name="selector"]').fill('#tab-statement');
+  await toolbar.getByRole('button', { name: '保存设置', exact: true }).click();
+  await page.waitForFunction(() => document.querySelector('#tab-statement').previousElementSibling?.dataset.qojTranslator === 'toolbar');
+  await toolbar.getByRole('button', { name: '翻译为中文', exact: true }).click();
+  await completed();
+  assert.equal(await page.locator('[data-qoj-translator="toolbar"]').count(), 1);
+  assert.match(await page.locator('article').textContent(), /中文/);
   assert.deepEqual(errors, []);
 });
