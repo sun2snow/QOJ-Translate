@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         QOJ 中文题面 · Responses API
 // @namespace    qoj-translate
-// @version      0.4.1
+// @version      0.5.0
 // @description  HTML 原位翻译、PDF 中文阅读版，保留原文并随时切换；兼容 OpenAI Responses API。
 // @match        https://qoj.ac/problem/*
 // @match        https://qoj.ac/contest/*/problem/*
@@ -164,6 +164,42 @@ A page may start/end mid-sentence: translate that fragment without adding missin
       parts.forEach((text, i) => segments.push({ id: `${id}_${i}`, text, context }));
     }
     return { root, records, segments };
+  }
+
+  function isChineseText(text) {
+    // Prefer a false negative to hiding controls on a foreign/bilingual page.
+    const prose = maskMath(text.replace(/```[\s\S]*?```|`[^`\n]+`/g, ' ')).masked.replace(/⟦QOJ_MATH_\d+⟧/g, ' ');
+    if (/\p{Letter}/u.test(prose.replace(/[\p{Script=Han}\p{Script=Latin}\p{Script=Greek}]/gu, ''))) return false;
+    const han = (prose.match(/\p{Script=Han}/gu) || []).length;
+    const words = (prose.match(/[\p{Script=Latin}\p{Script=Greek}]{2,}/gu) || []).length;
+    if (han < 24 || han < words * 4) return false;
+    return !prose.split(/\n+/).some(line => {
+      const latin = (line.match(/[\p{Script=Latin}\p{Script=Greek}]{2,}/gu) || []).length;
+      const chinese = (line.match(/\p{Script=Han}/gu) || []).length;
+      return latin >= 12 && chinese < latin * 4;
+    });
+  }
+  function originalHTMLText(root) {
+    const doc = root.ownerDocument, excluded = new WeakMap();
+    const skip = el => {
+      if (!el) return false;
+      if (excluded.has(el)) return excluded.get(el);
+      // Ignore the site's visibility state on the root/its ancestors. Otherwise
+      // switching tabs would change our language verdict for the same source.
+      const hidden = el !== root && (el.hidden || el.getAttribute('aria-hidden') === 'true' || doc.defaultView?.getComputedStyle(el).display === 'none');
+      const value = el.matches(PROTECTED) || hidden || (el !== root && skip(el.parentElement));
+      excluded.set(el, value);
+      return value;
+    };
+    const walker = doc.createTreeWalker(root, 4), parts = [];
+    let node, length = 0;
+    while ((node = walker.nextNode())) {
+      if (!node.nodeValue.trim() || skip(node.parentElement)) continue;
+      length += node.nodeValue.length;
+      if (length > 100000) return ''; // Don't classify only the start of a huge page.
+      parts.push(node.nodeValue);
+    }
+    return parts.join('\n');
   }
 
   function makeBatches(segments, maxChars) {
@@ -501,7 +537,7 @@ A page may start/end mid-sentence: translate that fragment without adding missin
   }
   function createPDFDiagnostic(config, pageURL) {
     const endpoint = new URL(config.endpoint), page = new URL(pageURL);
-    return { scriptVersion: '0.4.1', createdAt: new Date().toISOString(),
+    return { scriptVersion: '0.5.0', createdAt: new Date().toISOString(),
       endpoint: redactDiagnostic(endpoint.origin + endpoint.pathname, config.apiKey),
       pageURL: page.origin + page.pathname, model: redactDiagnostic(config.model, config.apiKey),
       pdfImages: config.pdfImages, maxOutputTokens: config.pdfOutputTokens, autoRepair: config.pdfAutoRepair,
@@ -922,6 +958,7 @@ A page may start/end mid-sentence: translate that fragment without adding missin
     pdfSchema, unsupportedFormat, requestPDFPage, createPDFDiagnostic, recordPDFDiagnostic,
     redactDiagnostic, removeCacheKeys,
     pdfInlineTokens, formulaToken, validatePDFContent, appendPDFInline, prepareMathCSS,
+    isChineseText, originalHTMLText,
   };
   if (typeof module === 'object' && module.exports) { module.exports = exportsForTests; return; }
 
@@ -1045,12 +1082,51 @@ A page may start/end mid-sentence: translate that fragment without adding missin
     dialog.append(header, form);
     shadow.append(dialog);
 
-    let boundRoot = null, rootListener = () => {};
+    let boundRoot = null, rootListener = () => {}, translationActive = false;
+    let nativeChinese = false, languageKey = null, languageProbe = null;
+    const applyLanguageVisibility = () => {
+      // Let an already-open settings dialog close normally; don't discard input.
+      const hidden = nativeChinese && !translationActive && !dialog.open;
+      if (host.hidden !== hidden) host.hidden = hidden;
+    };
+    const cancelLanguageProbe = () => {
+      if (languageProbe) { languageProbe.abort(); languageProbe = null; languageKey = null; }
+    };
+    const inspectOriginalLanguage = root => {
+      // Our translated HTML mutates the source DOM. Never reclassify it as a
+      // natively Chinese statement or hide the original/Chinese toggle.
+      if (translationActive) return;
+      let target;
+      try { target = detectStatement(document, location.href, currentConfig()); }
+      catch { cancelLanguageProbe(); languageKey = null; nativeChinese = false; applyLanguageVisibility(); return; }
+      if (target.root !== root) return;
+      if (target.kind === 'html') {
+        cancelLanguageProbe(); languageKey = null;
+        nativeChinese = isChineseText(originalHTMLText(root));
+        applyLanguageVisibility();
+        return;
+      }
+      if (languageKey === target.pdfURL) { applyLanguageVisibility(); return; }
+      cancelLanguageProbe();
+      nativeChinese = false;
+      languageKey = target.pdfURL;
+      applyLanguageVisibility();
+      const probe = languageProbe = new AbortController();
+      const timeout = setTimeout(() => probe.abort(), 15000);
+      checkChinesePDF(target.pdfURL, probe.signal).then(chinese => {
+        if (probe.signal.aborted || languageProbe !== probe || boundRoot !== root || translationActive) return;
+        nativeChinese = chinese;
+        applyLanguageVisibility();
+      }).catch(() => { /* Unreadable/scanned/blocked PDF: keep controls available. */ })
+        .finally(() => { clearTimeout(timeout); if (languageProbe === probe) languageProbe = null; });
+    };
+    window.addEventListener('pagehide', cancelLanguageProbe);
     function mount(root) {
       if (!root) {
         try { root = findStatementRoot(document, currentConfig().selector, boundRoot); } catch { root = null; }
       }
       if (root !== boundRoot) {
+        cancelLanguageProbe(); languageKey = null; nativeChinese = false;
         boundRoot = root;
         if (dialog.open) dialog.close();
         rootListener(root);
@@ -1067,7 +1143,7 @@ A page may start/end mid-sentence: translate that fragment without adding missin
         } else if (!host.hidden) host.hidden = true;
         return;
       }
-      if (host.hidden) host.hidden = false;
+      inspectOriginalLanguage(root);
       let anchor = root;
       // The PDF reading edition is inserted immediately before the source.
       // Always stay above BOTH editions when the MutationObserver runs.
@@ -1078,13 +1154,15 @@ A page may start/end mid-sentence: translate that fragment without adding missin
     }
     mount();
     let queued = false;
-    const observer = new MutationObserver(() => {
+    const observer = new MutationObserver(records => {
+      if (records.every(record => (record.target.nodeType === 1 ? record.target : record.target.parentElement)?.closest('[data-qoj-translator]'))) return;
       if (queued) return;
       queued = true;
       queueMicrotask(() => { queued = false; mount(); });
     });
     // Also support statements inserted asynchronously or replaced by the site.
-    observer.observe(document.body, { childList: true, subtree: true });
+    observer.observe(document.body, { childList: true, characterData: true, subtree: true,
+      attributes: true, attributeFilter: ['class', 'style', 'hidden', 'aria-hidden', 'src', 'data', 'lang'] });
 
     const closeMore = (restoreFocus = false) => {
       overflow.hidden = true;
@@ -1146,6 +1224,10 @@ A page may start/end mid-sentence: translate that fragment without adding missin
     };
     const setFormError = text => { formError.textContent = text; formError.hidden = !text; };
     const setState = (busy, hasResult, showingChinese, resumable = false, hasDiagnostic = false) => {
+      const wasActive = translationActive;
+      translationActive = busy || hasResult;
+      if (translationActive) { cancelLanguageProbe(); applyLanguageVisibility(); }
+      else if (wasActive) queueMicrotask(() => mount());
       const actionHadFocus = [translate, cancel, retranslate].includes(shadow.activeElement);
       translate.disabled = busy;
       translate.textContent = resumable ? '继续未完成页' : '翻译为中文';
@@ -1173,6 +1255,7 @@ A page may start/end mid-sentence: translate that fragment without adding missin
       host, translate, original, chinese, retranslate, cancel, settings, form, save, clear, diagnostic, resetFormat,
       setStatus, setFormError, setState, fill, getConfig, openSettings, closeSettings, closeMore, mount,
       watchRoot: listener => { rootListener = listener; },
+      isNativeChinese: () => nativeChinese,
     };
   }
 
@@ -1262,6 +1345,39 @@ A page may start/end mid-sentence: translate that fragment without adding missin
       if (signal.aborted) throw abortError();
       throw new Error(`无法解析 PDF：${e?.name === 'PasswordException' ? '不支持加密 PDF。' : '文件无效、字体/加载异常或页数超限。'}`);
     } finally { signal.removeEventListener('abort', abort); }
+  }
+
+  async function checkChinesePDF(url, signal) {
+    // No page images, model requests, or persistent copies: text extraction is
+    // entirely local. All pages must be readable; uncertain documents stay opt-in.
+    const { pdf, task, pdfjsLib } = await loadPDF(url, signal, () => {});
+    const abort = () => { task.destroy().catch(() => {}); };
+    signal.addEventListener('abort', abort, { once: true });
+    const texts = [];
+    let length = 0;
+    try {
+      for (let n = 1; n <= pdf.numPages; n++) {
+        checkAbort(signal);
+        const page = await pdf.getPage(n);
+        try {
+          const content = await page.getTextContent();
+          const text = pdfLines(content.items, page.getViewport({ scale: 1 }), pdfjsLib.Util.transform);
+          checkAbort(signal);
+          length += text.length;
+          if (length > 500000 || !/[\p{Letter}]/u.test(text)) return false;
+          // An obviously foreign page is enough to retain the toolbar. A short
+          // Chinese continuation/sample page can contribute to the total below.
+          const han = (text.match(/\p{Script=Han}/gu) || []).length;
+          const words = (text.match(/\p{Script=Latin}{2,}/gu) || []).length;
+          if (words >= 12 && han < words * 4) return false;
+          texts.push(text);
+        } finally { page.cleanup(); }
+      }
+      return isChineseText(texts.join('\n'));
+    } finally {
+      signal.removeEventListener('abort', abort);
+      await task.destroy().catch(() => {});
+    }
   }
 
   function makePDFContainer(target) {
@@ -1496,7 +1612,7 @@ A page may start/end mid-sentence: translate that fragment without adding missin
     ui.original.onclick = () => showLanguage(false);
     ui.chinese.onclick = () => showLanguage(true);
     const startTranslation = async () => {
-      if (controller) return;
+      if (controller || ui.isNativeChinese()) return;
       try { checkConfig(config); } catch (e) { ui.openSettings(); ui.setFormError(e.message); return; }
       const force = !!result;
       if (force && !window.confirm('重新翻译会绕过本题缓存并再次调用 API，可能产生费用。继续吗？')) return;
