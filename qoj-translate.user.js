@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         QOJ 中文题面 · Responses API
 // @namespace    qoj-translate
-// @version      0.6.3
+// @version      0.6.4
 // @description  HTML 原位翻译、PDF 中文阅读版，保留原文并随时切换；兼容 OpenAI Responses API。
 // @match        https://qoj.ac/problem/*
 // @match        https://qoj.ac/contest/*/problem/*
@@ -674,7 +674,7 @@ A page may start/end mid-sentence: translate that fragment without adding missin
   }
   function createPDFDiagnostic(config, pageURL) {
     const endpoint = new URL(config.endpoint), page = new URL(pageURL);
-    return { scriptVersion: '0.6.3', createdAt: new Date().toISOString(),
+    return { scriptVersion: '0.6.4', createdAt: new Date().toISOString(),
       endpoint: redactDiagnostic(endpoint.origin + endpoint.pathname, config.apiKey),
       pageURL: page.origin + page.pathname, model: redactDiagnostic(config.model, config.apiKey),
       pdfImages: config.pdfImages, maxOutputTokens: config.pdfOutputTokens, autoRepair: config.pdfAutoRepair,
@@ -1144,8 +1144,9 @@ A page may start/end mid-sentence: translate that fragment without adding missin
       .status-group{display:flex;flex:1 1 120px;align-items:center;gap:7px;min-width:0;color:#758196}
       .dot{width:6px;height:6px;border-radius:50%;background:#a4afbe;flex:none}
       .busy .dot{background:#3975cc;animation:pulse 1.2s ease-in-out infinite}.error .dot{background:#b33b46}
-      .status{overflow:hidden;white-space:nowrap;text-overflow:ellipsis;min-width:0;font-size:12px}
-      .error .status{color:#a52c3a}.info{padding:0;min-height:24px;min-width:24px;font-size:12px;flex:none}
+      .status{overflow:hidden;white-space:nowrap;text-overflow:ellipsis;min-width:0;min-height:24px;padding:0;border:0;background:transparent;color:inherit;text-align:left;font-size:12px}
+      .status:hover:not(:disabled){background:transparent;color:inherit;text-decoration:underline;text-underline-offset:3px}
+      .error .status{color:#a52c3a}
       .actions{display:flex;align-items:center;gap:5px;margin-left:auto;flex:none;flex-wrap:wrap;max-width:100%}
       .overflow-actions{position:fixed;inset:auto;margin:0;width:208px;max-width:calc(100vw - 16px);box-sizing:border-box;padding:5px;border:1px solid #dfe5ee;border-radius:8px;background:#fff;color:#526076;box-shadow:0 8px 28px #1c2d481c;overflow-y:auto;font:13px/1.5 system-ui,sans-serif}
       .overflow-actions:popover-open{display:flex;flex-direction:column;gap:2px}
@@ -1174,10 +1175,9 @@ A page may start/end mid-sentence: translate that fragment without adding missin
     const original = element(document, 'button', '原文', { type: 'button', 'aria-label': '查看原文', 'aria-pressed': 'true' });
     const chinese = element(document, 'button', '中文', { type: 'button', 'aria-label': '查看中文', 'aria-pressed': 'false', disabled: '', title: '请先翻译题面' });
     languages.append(original, chinese);
-    const statusGroup = element(document, 'div', null, { class: 'status-group' });
-    const status = element(document, 'span', '请先配置 API', { class: 'status', role: 'status', 'aria-live': 'polite', 'aria-atomic': 'true' });
-    const info = element(document, 'button', 'ⓘ', { type: 'button', class: 'info', 'aria-label': '状态详情', 'aria-expanded': 'false', 'aria-controls': 'status-detail', title: '查看完整状态信息' });
-    statusGroup.append(element(document, 'span', null, { class: 'dot', 'aria-hidden': 'true' }), status, info);
+    const statusGroup = element(document, 'div', null, { class: 'status-group', role: 'status', 'aria-live': 'polite', 'aria-atomic': 'true' });
+    const status = element(document, 'button', '请先配置 API', { type: 'button', class: 'status', 'aria-expanded': 'false', 'aria-controls': 'status-detail', title: '点击查看完整状态信息' });
+    statusGroup.append(element(document, 'span', null, { class: 'dot', 'aria-hidden': 'true' }), status);
     const actions = element(document, 'div', null, { class: 'actions' });
     const translate = element(document, 'button', '翻译为中文', { type: 'button', class: 'primary' });
     const cancel = element(document, 'button', '取消', { type: 'button', class: 'outline', hidden: '' });
@@ -1287,7 +1287,7 @@ A page may start/end mid-sentence: translate that fragment without adding missin
     const applyLanguageVisibility = () => {
       // Let an already-open settings dialog close normally; don't discard input.
       const hidden = nativeChinese && !translationActive && !dialog.open;
-      if (hidden) { detail.hidden = true; closeMore(); }
+      if (hidden) { detail.hidden = true; status.setAttribute('aria-expanded', 'false'); closeMore(); }
       if (host.hidden !== hidden) host.hidden = hidden;
       const hideCopy = !copyable || !boundRoot?.getClientRects().length || getComputedStyle(boundRoot).visibility === 'hidden';
       if (copyHost.hidden !== hideCopy) {
@@ -1460,9 +1460,9 @@ A page may start/end mid-sentence: translate that fragment without adding missin
         event.stopPropagation();
       }
     });
-    info.onclick = () => {
+    status.onclick = () => {
       detail.hidden = !detail.hidden;
-      info.setAttribute('aria-expanded', String(!detail.hidden));
+      status.setAttribute('aria-expanded', String(!detail.hidden));
     };
     const fill = config => {
       for (const [name, input] of Object.entries(inputs)) {
@@ -1493,7 +1493,7 @@ A page may start/end mid-sentence: translate that fragment without adding missin
       detail.textContent = text;
       statusGroup.classList.toggle('error', error);
       detail.classList.toggle('error', error);
-      if (error) { detail.hidden = false; info.setAttribute('aria-expanded', 'true'); }
+      if (error) { detail.hidden = false; status.setAttribute('aria-expanded', 'true'); }
     };
     const setFormError = text => { formError.textContent = text; formError.hidden = !text; };
     const setState = (busy, hasResult, showingChinese, resumable = false, hasDiagnostic = false) => {
@@ -1519,7 +1519,7 @@ A page may start/end mid-sentence: translate that fragment without adding missin
       diagnostic.disabled = busy || !hasDiagnostic;
       resetFormat.disabled = busy;
       statusGroup.classList.toggle('busy', busy);
-      if (busy) { detail.hidden = true; info.setAttribute('aria-expanded', 'false'); closeMore(); }
+      if (busy) { detail.hidden = true; status.setAttribute('aria-expanded', 'false'); closeMore(); }
       if (actionHadFocus && host.getClientRects().length) (busy ? cancel : hasResult ? (showingChinese ? chinese : original) : translate).focus();
     };
     copy.onclick = async () => {
