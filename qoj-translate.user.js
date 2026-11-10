@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         QOJ 中文题面 · Responses API
 // @namespace    qoj-translate
-// @version      0.5.0
+// @version      0.6.0
 // @description  HTML 原位翻译、PDF 中文阅读版，保留原文并随时切换；兼容 OpenAI Responses API。
 // @match        https://qoj.ac/problem/*
 // @match        https://qoj.ac/contest/*/problem/*
@@ -10,6 +10,7 @@
 // @grant        GM_setValue
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getResourceText
+// @grant        GM_setClipboard
 // @connect      qoj.ac
 // @connect      *
 // @resource     pdfjsModule https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.min.mjs
@@ -18,7 +19,7 @@
 // @resource     katexCSS https://cdn.jsdelivr.net/npm/katex@0.18.2/dist/katex.min.css
 // ==/UserScript==
 
-/* global GM_getValue, GM_setValue, GM_xmlhttpRequest, GM_getResourceText,
+/* global GM_getValue, GM_setValue, GM_xmlhttpRequest, GM_getResourceText, GM_setClipboard,
           katex */
 (() => {
   'use strict';
@@ -200,6 +201,142 @@ A page may start/end mid-sentence: translate that fragment without adding missin
       parts.push(node.nodeValue);
     }
     return parts.join('\n');
+  }
+
+  function statementMarkdown(root) {
+    const doc = root.ownerDocument;
+    if (root.textContent.length > 2000000) throw new Error('题面过大，暂不复制。');
+    const warnings = new Set(), saved = [];
+    let prefix = 'QOJMDTOKEN';
+    while (root.textContent.includes(prefix)) prefix += 'X';
+    const keep = value => { const key = `${prefix}${saved.length}END`; saved.push(value); return key; };
+    const restore = value => value.replace(new RegExp(`${prefix}(\\d+)END`, 'g'), (_, i) => saved[Number(i)]);
+    const escape = value => value.replace(/\\/g, '\\\\').replace(/([`*_{}\[\]<>~|])/g, '\\$1')
+      .replace(/(^|\n)(\s*)(#{1,6}|>|[-+])(\s)/g, '$1$2\\$3$4').replace(/(^|\n)(\s*\d+)\.(\s)/g, '$1$2\\.$3');
+    const text = value => {
+      value = value.replace(/\u00a0/g, ' ');
+      const plain = part => escape(part.replace(/[\t\r\n ]+/g, ' '));
+      let output = '', offset = 0;
+      for (const match of value.matchAll(/\$\$[\s\S]*?\$\$|\\\[[\s\S]*?\\\]|\\\([\s\S]*?\\\)|(?<!\\)\$(?!\$)[^$\n]+?(?<!\\)\$/g)) {
+        output += plain(value.slice(offset, match.index)) + keep(match[0]);
+        offset = match.index + match[0].length;
+      }
+      return output + plain(value.slice(offset));
+    };
+    const url = (value, image = false) => {
+      if (!value) return '';
+      try {
+        const parsed = new URL(value, doc.baseURI);
+        if (parsed.username || parsed.password || !(['https:', 'http:'].includes(parsed.protocol) || (!image && parsed.protocol === 'mailto:'))) return '';
+        return parsed.href.replace(/[()<>\\]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+      } catch { return ''; }
+    };
+    const skip = el => el.matches('button,input,select,textarea,script:not([type^="math/tex"]),style,noscript,iframe,object,embed,[data-qoj-translator],.sample-copy,.copy-button,.line-numbers-rows') ||
+      el.hidden || el.getAttribute('aria-hidden') === 'true' || doc.defaultView?.getComputedStyle(el).display === 'none';
+    const plainCode = node => node.nodeType === 3 ? node.nodeValue : node.nodeType !== 1 || skip(node) ? '' :
+      node.tagName === 'BR' ? '\n' : Array.from(node.childNodes).map(plainCode).join('');
+    const backticks = (value, min) => '`'.repeat((value.match(/`+/g) || []).reduce((n, run) => Math.max(n, run.length + 1), min));
+    const block = value => '\n\n' + value.trim() + '\n\n';
+    const math = (source, display) => keep(display ? `\n\n$$\n${source.trim()}\n$$\n\n` : `$${source.trim()}$`);
+    const mathSelector = '.katex-display,.katex,mjx-container,.MathJax,.MathJax_Display,.MathJax_SVG,.MathJax_SVG_Display,.MathJax_CHTML,.MathJax_CHTML_Display,math';
+    const children = node => Array.from(node.childNodes).map(convert).join('');
+    const mathSource = el => {
+      const annotation = el.querySelector('annotation[encoding="application/x-tex"],annotation[encoding="application/x-latex"]');
+      return annotation?.textContent || el.getAttribute('data-tex') || el.getAttribute('data-latex') || el.getAttribute('alttext') ||
+        el.querySelector('[data-tex]')?.getAttribute('data-tex');
+    };
+    function convert(node) {
+      if (node.nodeType === 3) return text(node.nodeValue);
+      if (node.nodeType !== 1) return '';
+      const tag = node.tagName.toLowerCase();
+      // MathJax v2 keeps its source in hidden math/tex scripts. Omit the
+      // associated presentation tree so its formula is not exported twice.
+      if (tag === 'script' && /^math\/tex(?:;|$)/i.test(node.type)) return math(node.textContent, /mode\s*=\s*display/i.test(node.type));
+      if (node.matches('.MathJax_Preview,.MJX_Assistive_MathML') || skip(node)) return '';
+      if (node.matches(mathSelector)) {
+        let next = node.nextElementSibling;
+        if (next?.matches('.MathJax_Preview')) next = next.nextElementSibling;
+        if (next?.matches('script[type^="math/tex"]')) return '';
+        const source = mathSource(node);
+        const display = node.matches('.katex-display,.MathJax_Display,.MathJax_SVG_Display,.MathJax_CHTML_Display') || node.getAttribute('display') === 'true' || node.getAttribute('display') === 'block';
+        if (source) return math(source, display);
+        warnings.add('部分公式缺少 LaTeX 源码，已保留可提取文本');
+        return keep(escape(node.textContent.trim() || '[公式缺少可提取源码]'));
+      }
+      if (tag === 'img') {
+        if (node.matches('.tex,.latex') && node.alt) return math(node.alt, false);
+        const src = url(node.getAttribute('src') || node.getAttribute('data-src') || '', true);
+        if (!src) { warnings.add('部分图片无法导出链接'); return text(node.alt || '[图片]'); }
+        return keep(`![${escape(node.alt || '')}](${src})`);
+      }
+      if (tag === 'svg' || tag === 'canvas') { warnings.add('内嵌图形未转换为图片'); return text(node.getAttribute('aria-label') || '[内嵌图形]'); }
+      if (tag === 'pre' || (node.matches('.sample-input,.sample-output,.sampledata') && !node.querySelector('pre'))) {
+        const value = plainCode(node).replace(/\r\n?/g, '\n');
+        const language = (node.querySelector('code')?.className || node.className || '').match(/(?:language-|lang-)([\w+-]+)/)?.[1] || '';
+        const marker = backticks(value, 3);
+        return block(keep(`${marker}${language}\n${value}${value.endsWith('\n') ? '' : '\n'}${marker}`));
+      }
+      if (tag === 'code' || tag === 'kbd' || tag === 'samp') {
+        const value = plainCode(node).replace(/\r?\n/g, ' ');
+        const marker = backticks(value, 1);
+        const pad = /^`|`$|^ .* $/.test(value) ? ' ' : '';
+        return keep(`${marker}${pad}${value}${pad}${marker}`);
+      }
+      if (tag === 'table') {
+        const rows = Array.from(node.rows).filter(row => row.closest('table') === node && !skip(row));
+        if (!rows.length) return '';
+        const cells = rows.map(row => Array.from(row.cells).map(cell => restore(children(cell)).trim().replace(/\r?\n/g, '<br>').replace(/(\\*)\|/g, (_, slashes) => slashes + (slashes.length % 2 ? '' : '\\') + '|')));
+        const width = Math.max(...cells.map(row => row.length));
+        const rowText = row => '| ' + Array.from({ length: width }, (_, i) => row[i] || '').join(' | ') + ' |';
+        // Don't invent headings for tables that have no header row.
+        const hasHeader = rows[0].querySelector('th') !== null;
+        const header = hasHeader ? cells.shift() : [];
+        if (rows.some(row => Array.from(row.cells).some(cell => cell.rowSpan > 1 || cell.colSpan > 1))) warnings.add('合并单元格已简化为普通表格');
+        const table = [rowText(header), rowText(Array(width).fill('---')), ...cells.map(rowText)].join('\n');
+        return block(keep((node.caption ? restore(children(node.caption)).trim() + '\n\n' : '') + table));
+      }
+      if (tag === 'ul' || tag === 'ol') {
+        let number = Number(node.getAttribute('start')) || 1;
+        const items = Array.from(node.children).filter(el => el.tagName === 'LI' && !skip(el)).map(li => {
+          if (li.hasAttribute('value')) number = Number(li.getAttribute('value')) || number;
+          const marker = tag === 'ol' ? `${number++}. ` : '- ';
+          const value = restore(children(li)).trim();
+          return marker + value.replace(/\n/g, '\n' + ' '.repeat(marker.length));
+        });
+        return block(keep(items.join('\n')));
+      }
+      if (tag === 'br') return keep('  \n');
+      if (tag === 'hr') return block('---');
+      const value = children(node);
+      if (/^h[1-6]$/.test(tag)) return block('#'.repeat(Number(tag[1])) + ' ' + value.trim());
+      if (tag === 'strong' || tag === 'b' || tag === 'em' || tag === 'i' || tag === 'del' || tag === 's') {
+        const marker = tag === 'strong' || tag === 'b' ? '**' : tag === 'del' || tag === 's' ? '~~' : '*';
+        return value.trim() ? value.replace(/^(\s*)([\s\S]*?)(\s*)$/, (_, a, b, c) => a + marker + b + marker + c) : value;
+      }
+      if (tag === 'a') {
+        const href = node.getAttribute('href'), dest = href && url(href);
+        return dest ? `[${value.trim() || text(href)}](${dest})` : value;
+      }
+      if (tag === 'blockquote') return block(keep(restore(value).trim().replace(/^/gm, '> ')));
+      if (['p', 'div', 'section', 'article', 'header', 'footer', 'figure', 'figcaption', 'dl', 'dt', 'dd', 'details', 'summary'].includes(tag)) return block(value);
+      return value;
+    }
+    const markdown = restore(children(root).replace(/ +\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim()).trim() + '\n';
+    if (!markdown.trim()) throw new Error('题面没有可复制的文本。');
+    return { markdown, warnings: Array.from(warnings) };
+  }
+
+  async function copyMarkdownText(text) {
+    if (typeof GM_setClipboard === 'function') {
+      // Prefer the user-script grant, which needs no API key or page permission.
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('剪贴板写入超时，请重试。')), 5000);
+        try { GM_setClipboard(text, 'text', () => { clearTimeout(timer); resolve(); }); }
+        catch (error) { clearTimeout(timer); reject(error); }
+      });
+    } else if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+    } else throw new Error('剪贴板不可用，请检查用户脚本权限。');
   }
 
   function makeBatches(segments, maxChars) {
@@ -537,7 +674,7 @@ A page may start/end mid-sentence: translate that fragment without adding missin
   }
   function createPDFDiagnostic(config, pageURL) {
     const endpoint = new URL(config.endpoint), page = new URL(pageURL);
-    return { scriptVersion: '0.5.0', createdAt: new Date().toISOString(),
+    return { scriptVersion: '0.6.0', createdAt: new Date().toISOString(),
       endpoint: redactDiagnostic(endpoint.origin + endpoint.pathname, config.apiKey),
       pageURL: page.origin + page.pathname, model: redactDiagnostic(config.model, config.apiKey),
       pdfImages: config.pdfImages, maxOutputTokens: config.pdfOutputTokens, autoRepair: config.pdfAutoRepair,
@@ -641,8 +778,8 @@ A page may start/end mid-sentence: translate that fragment without adding missin
     }
     return root;
   }
-  function detectStatement(doc, locationHref, config) {
-    const root = findStatementRoot(doc, config.selector);
+  function detectStatement(doc, locationHref, config, knownRoot = null) {
+    const root = findStatementRoot(doc, config.selector, knownRoot);
     let pdfURL = null;
     if (config.pdfURL.trim()) {
       const url = new URL(config.pdfURL.trim(), locationHref);
@@ -958,7 +1095,7 @@ A page may start/end mid-sentence: translate that fragment without adding missin
     pdfSchema, unsupportedFormat, requestPDFPage, createPDFDiagnostic, recordPDFDiagnostic,
     redactDiagnostic, removeCacheKeys,
     pdfInlineTokens, formulaToken, validatePDFContent, appendPDFInline, prepareMathCSS,
-    isChineseText, originalHTMLText,
+    isChineseText, originalHTMLText, statementMarkdown, copyMarkdownText,
   };
   if (typeof module === 'object' && module.exports) { module.exports = exportsForTests; return; }
 
@@ -987,7 +1124,9 @@ A page may start/end mid-sentence: translate that fragment without adding missin
       .busy .dot{background:#3975cc;animation:pulse 1.2s ease-in-out infinite}.error .dot{background:#b33b46}
       .status{overflow:hidden;white-space:nowrap;text-overflow:ellipsis;min-width:0;font-size:12px}
       .error .status{color:#a52c3a}.info{padding:0;min-height:24px;min-width:24px;font-size:12px;flex:none}
-      .actions{display:flex;align-items:center;gap:5px;margin-left:auto;flex:none}
+      .actions{display:flex;align-items:center;gap:5px;margin-left:auto;flex:none;flex-wrap:wrap;max-width:100%}
+      .copy-status{font-size:12px;color:#65718a;max-width:260px;overflow-wrap:anywhere}
+      .copy-only .languages,.copy-only .status-group,.copy-only .translation-action,.copy-only .overflow-actions{display:none!important}
       .overflow-actions{display:flex;justify-content:flex-end;gap:6px;flex-wrap:wrap;padding:7px 10px;border-top:1px solid #edf0f5;background:#fafbfd;border-radius:0 0 8px 8px}
       .status-detail{margin:0;padding:10px 12px;border-top:1px solid #edf0f5;white-space:pre-wrap;overflow-wrap:anywhere;max-height:160px;overflow:auto;font-size:12px;color:#5d6a7d}
       .status-detail.error{color:#a52c3a;background:#fff8f8}
@@ -1022,7 +1161,10 @@ A page may start/end mid-sentence: translate that fragment without adding missin
     const cancel = element(document, 'button', '取消', { type: 'button', class: 'outline', hidden: '' });
     const settings = element(document, 'button', '⚙', { type: 'button', class: 'icon', 'aria-label': '设置', title: '翻译设置', 'aria-haspopup': 'dialog' });
     const more = element(document, 'button', '⋯', { type: 'button', class: 'icon', 'aria-label': '更多操作', 'aria-expanded': 'false', 'aria-controls': 'overflow-actions', title: '更多操作' });
-    actions.append(translate, cancel, settings, more);
+    const copy = element(document, 'button', '复制 Markdown', { type: 'button', class: 'outline', hidden: '', title: '复制当前显示的 HTML 题面，不调用 API' });
+    const copyStatus = element(document, 'span', '', { class: 'copy-status', role: 'status', hidden: '' });
+    for (const button of [translate, cancel, settings, more]) button.classList.add('translation-action');
+    actions.append(copyStatus, copy, translate, cancel, settings, more);
     bar.append(languages, statusGroup, actions);
     const overflow = element(document, 'div', null, { id: 'overflow-actions', class: 'overflow-actions', role: 'group', 'aria-label': '更多操作', hidden: '' });
     const retranslate = element(document, 'button', '重新翻译', { type: 'button', disabled: '' });
@@ -1083,11 +1225,16 @@ A page may start/end mid-sentence: translate that fragment without adding missin
     shadow.append(dialog);
 
     let boundRoot = null, rootListener = () => {}, translationActive = false;
-    let nativeChinese = false, languageKey = null, languageProbe = null;
+    let nativeChinese = false, languageKey = null, languageProbe = null, copyable = false, copying = false, uiBusy = false;
     const applyLanguageVisibility = () => {
       // Let an already-open settings dialog close normally; don't discard input.
-      const hidden = nativeChinese && !translationActive && !dialog.open;
+      const copyOnly = nativeChinese && !translationActive && !dialog.open;
+      shell.classList.toggle('copy-only', copyOnly);
+      if (copyOnly) detail.hidden = true;
+      const hidden = copyOnly && !copyable;
       if (host.hidden !== hidden) host.hidden = hidden;
+      copy.hidden = !copyable;
+      copy.disabled = uiBusy || copying || !copyable;
     };
     const cancelLanguageProbe = () => {
       if (languageProbe) { languageProbe.abort(); languageProbe = null; languageKey = null; }
@@ -1095,11 +1242,12 @@ A page may start/end mid-sentence: translate that fragment without adding missin
     const inspectOriginalLanguage = root => {
       // Our translated HTML mutates the source DOM. Never reclassify it as a
       // natively Chinese statement or hide the original/Chinese toggle.
-      if (translationActive) return;
       let target;
-      try { target = detectStatement(document, location.href, currentConfig()); }
-      catch { cancelLanguageProbe(); languageKey = null; nativeChinese = false; applyLanguageVisibility(); return; }
+      try { target = detectStatement(document, location.href, currentConfig(), root); }
+      catch { cancelLanguageProbe(); languageKey = null; nativeChinese = false; copyable = false; applyLanguageVisibility(); return; }
       if (target.root !== root) return;
+      copyable = target.kind === 'html';
+      if (translationActive) { applyLanguageVisibility(); return; }
       if (target.kind === 'html') {
         cancelLanguageProbe(); languageKey = null;
         nativeChinese = isChineseText(originalHTMLText(root));
@@ -1126,7 +1274,8 @@ A page may start/end mid-sentence: translate that fragment without adding missin
         try { root = findStatementRoot(document, currentConfig().selector, boundRoot); } catch { root = null; }
       }
       if (root !== boundRoot) {
-        cancelLanguageProbe(); languageKey = null; nativeChinese = false;
+        cancelLanguageProbe(); languageKey = null; nativeChinese = false; copyable = false;
+        copyStatus.hidden = true;
         boundRoot = root;
         if (dialog.open) dialog.close();
         rootListener(root);
@@ -1136,6 +1285,7 @@ A page may start/end mid-sentence: translate that fragment without adding missin
       if (!root) {
         // Keep settings available only INSIDE a known statement panel; never
         // fall back to body/main, where we'd cover unrelated tabs.
+        copy.hidden = true;
         const panel = findStatementPanel(document);
         if (panel) {
           if (host.parentNode !== panel) panel.prepend(host);
@@ -1224,6 +1374,8 @@ A page may start/end mid-sentence: translate that fragment without adding missin
     };
     const setFormError = text => { formError.textContent = text; formError.hidden = !text; };
     const setState = (busy, hasResult, showingChinese, resumable = false, hasDiagnostic = false) => {
+      uiBusy = busy;
+      copy.disabled = busy || copying || !copyable;
       const wasActive = translationActive;
       translationActive = busy || hasResult;
       if (translationActive) { cancelLanguageProbe(); applyLanguageVisibility(); }
@@ -1246,6 +1398,28 @@ A page may start/end mid-sentence: translate that fragment without adding missin
       statusGroup.classList.toggle('busy', busy);
       if (busy) { detail.hidden = true; info.setAttribute('aria-expanded', 'false'); closeMore(); }
       if (actionHadFocus && host.getClientRects().length) (busy ? cancel : hasResult ? (showingChinese ? chinese : original) : translate).focus();
+    };
+    copy.onclick = async () => {
+      if (uiBusy || copying || !copyable) return;
+      const source = boundRoot;
+      copying = true;
+      copy.disabled = true;
+      copyStatus.hidden = true;
+      try {
+        const target = detectStatement(document, location.href, currentConfig(), source);
+        if (target.kind !== 'html' || target.root !== source) throw new Error('题面已变化，请重试。');
+        const { markdown, warnings } = statementMarkdown(source);
+        await copyMarkdownText(markdown);
+        if (boundRoot === source) {
+          copyStatus.textContent = warnings.length ? `已复制；${warnings.join('；')}。` : '已复制 Markdown';
+          copyStatus.hidden = false;
+        }
+      } catch (error) {
+        if (boundRoot === source) {
+          copyStatus.textContent = '复制失败：' + (error.message || '请检查剪贴板权限后重试。');
+          copyStatus.hidden = false;
+        }
+      } finally { copying = false; copy.disabled = uiBusy || !copyable; }
     };
     const getConfig = () => Object.fromEntries(Object.entries(inputs).map(([key, input]) => [key,
       input.type === 'checkbox' ? input.checked : input.type === 'number' ? Number(input.value) : input.value.trim(),
