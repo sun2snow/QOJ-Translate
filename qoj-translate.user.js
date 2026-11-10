@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         QOJ 中文题面 · Responses API
 // @namespace    qoj-translate
-// @version      0.6.2
+// @version      0.6.3
 // @description  HTML 原位翻译、PDF 中文阅读版，保留原文并随时切换；兼容 OpenAI Responses API。
 // @match        https://qoj.ac/problem/*
 // @match        https://qoj.ac/contest/*/problem/*
@@ -674,7 +674,7 @@ A page may start/end mid-sentence: translate that fragment without adding missin
   }
   function createPDFDiagnostic(config, pageURL) {
     const endpoint = new URL(config.endpoint), page = new URL(pageURL);
-    return { scriptVersion: '0.6.2', createdAt: new Date().toISOString(),
+    return { scriptVersion: '0.6.3', createdAt: new Date().toISOString(),
       endpoint: redactDiagnostic(endpoint.origin + endpoint.pathname, config.apiKey),
       pageURL: page.origin + page.pathname, model: redactDiagnostic(config.model, config.apiKey),
       pdfImages: config.pdfImages, maxOutputTokens: config.pdfOutputTokens, autoRepair: config.pdfAutoRepair,
@@ -722,6 +722,28 @@ A page may start/end mid-sentence: translate that fragment without adding missin
     }
     return null;
   }
+  function findCopyHeading(root) {
+    const doc = root.ownerDocument;
+    // A title embedded in an HTML statement is safe too: translation/export
+    // already excludes our host. Never treat an ordinary "Input" h2 as a title.
+    const internal = root.querySelector('.uoj-problem-title,.problem-title,h1');
+    if (internal && !internal.closest('[data-qoj-translator]')) return internal;
+    // Search only the statement's surrounding content, never global navigation
+    // or a heading belonging to another tab/article. Prefer known title styles.
+    for (let scope = root.parentElement; scope && scope !== doc.body; scope = scope.parentElement) {
+      for (const selector of ['.uoj-problem-title,.problem-title,h1', 'h2']) {
+        const headings = Array.from(scope.querySelectorAll(selector)).filter(heading => {
+          const panel = heading.closest('#tab-statement,#statement,.tab-pane,[role="tabpanel"]');
+          return !root.contains(heading) && !heading.closest('nav,aside,form,article,[data-qoj-translator]') &&
+            (!panel || panel.contains(root)) && !!(heading.compareDocumentPosition(root) & 4);
+        });
+        if (headings.length) return headings.at(-1);
+      }
+      if (scope.matches('main,.uoj-content,.container')) break;
+    }
+    return null;
+  }
+
   function findStatementPanel(doc) {
     return doc.querySelector('#tab-statement') || doc.querySelector('#statement') ||
       doc.querySelector('#problem-statement') || doc.querySelector('#problem-statement-content') || doc.querySelector('.problem-statement');
@@ -1163,19 +1185,20 @@ A page may start/end mid-sentence: translate that fragment without adding missin
     const more = element(document, 'button', '⋯', { type: 'button', class: 'icon', 'aria-label': '更多操作', 'aria-expanded': 'false', 'aria-controls': 'overflow-actions', title: '更多操作' });
     actions.append(translate, cancel, settings, more);
 
-    // Copy is an independent, content-sized action, not an empty translation
-    // shell on native Chinese statements. Both hosts stay inside the site tab.
+    // Dock this independent action in the title when available, with a compact
+    // in-panel fallback. Its visibility always follows the statement tab.
     const copyHost = element(document, 'div', null, { 'data-qoj-translator': 'copy', translate: 'no', hidden: '' });
     const copyShadow = copyHost.attachShadow({ mode: 'closed' });
     copyShadow.append(element(document, 'style', `
       :host{display:block;width:fit-content;max-width:100%;margin:4px 0 8px auto;color-scheme:light;font:12px/1.5 system-ui,sans-serif}
+      :host([data-dock="title"]){float:right;margin:1px 0 0 12px;max-width:100%}
       :host([hidden]),[hidden]{display:none!important}
-      .copy-row{display:flex;justify-content:flex-end;align-items:center;gap:8px;flex-wrap:wrap}
+      .copy-row{position:relative;display:flex;justify-content:flex-end;align-items:center}
       button{display:inline-flex;align-items:center;gap:5px;min-height:28px;padding:3px 6px;border:0;border-radius:4px;background:transparent;color:#738096;font:inherit;white-space:nowrap;cursor:pointer}
       button:hover:not(:disabled){background:#f1f4f8;color:#326bb5}
       button:focus-visible{outline:2px solid #3975cc;outline-offset:2px}
       button:disabled{opacity:.45;cursor:default}
-      .copy-status{max-width:min(320px,100%);color:#65718a;overflow-wrap:anywhere}
+      .copy-status{position:absolute;right:0;top:calc(100% + 4px);z-index:10;width:max-content;max-width:min(320px,calc(100vw - 32px));box-sizing:border-box;padding:5px 9px;border:1px solid #e0e5ed;border-radius:5px;background:#fff;box-shadow:0 3px 12px #17203312;color:#65718a;overflow-wrap:anywhere;pointer-events:none}
     `));
     const copy = element(document, 'button', null, { type: 'button', title: '复制当前显示的 HTML 题面，不调用 API' });
     copy.append(element(document, 'span', '⧉', { 'aria-hidden': 'true' }), document.createTextNode('复制 Markdown'));
@@ -1183,6 +1206,20 @@ A page may start/end mid-sentence: translate that fragment without adding missin
     const copyRow = element(document, 'div', null, { class: 'copy-row' });
     copyRow.append(copyStatus, copy);
     copyShadow.append(copyRow);
+    let copyFeedbackTimer = null;
+    const clearCopyFeedback = () => {
+      clearTimeout(copyFeedbackTimer);
+      copyFeedbackTimer = null;
+      copyStatus.hidden = true;
+      copyStatus.textContent = '';
+    };
+    const showCopyFeedback = (text, duration) => {
+      clearCopyFeedback();
+      copyStatus.textContent = text;
+      copyStatus.hidden = false;
+      copyFeedbackTimer = setTimeout(clearCopyFeedback, duration);
+    };
+    window.addEventListener('pagehide', clearCopyFeedback);
     bar.append(languages, statusGroup, actions);
     const overflow = element(document, 'div', null, { id: 'overflow-actions', class: 'overflow-actions', role: 'group', 'aria-label': '更多操作', popover: 'auto' });
     // Associate the invoker so native light-dismiss doesn't reopen the popover
@@ -1252,7 +1289,11 @@ A page may start/end mid-sentence: translate that fragment without adding missin
       const hidden = nativeChinese && !translationActive && !dialog.open;
       if (hidden) { detail.hidden = true; closeMore(); }
       if (host.hidden !== hidden) host.hidden = hidden;
-      if (copyHost.hidden === copyable) copyHost.hidden = !copyable;
+      const hideCopy = !copyable || !boundRoot?.getClientRects().length || getComputedStyle(boundRoot).visibility === 'hidden';
+      if (copyHost.hidden !== hideCopy) {
+        copyHost.hidden = hideCopy;
+        if (hideCopy) clearCopyFeedback();
+      }
       copy.disabled = uiBusy || copying || !copyable;
     };
     const cancelLanguageProbe = () => {
@@ -1295,7 +1336,7 @@ A page may start/end mid-sentence: translate that fragment without adding missin
       if (root !== boundRoot) {
         closeMore();
         cancelLanguageProbe(); languageKey = null; nativeChinese = false; copyable = false;
-        copyStatus.hidden = true;
+        clearCopyFeedback();
         boundRoot = root;
         if (dialog.open) dialog.close();
         rootListener(root);
@@ -1308,6 +1349,7 @@ A page may start/end mid-sentence: translate that fragment without adding missin
         // Keep settings available only INSIDE a known statement panel; never
         // fall back to body/main, where we'd cover unrelated tabs.
         copyHost.hidden = true;
+        clearCopyFeedback();
         const panel = findStatementPanel(document);
         if (panel) {
           if (host.parentNode !== panel) panel.prepend(host);
@@ -1322,7 +1364,16 @@ A page may start/end mid-sentence: translate that fragment without adding missin
       if (root?.previousElementSibling?.matches('[data-qoj-translator="pdf"]')) anchor = root.previousElementSibling;
       if (anchor && anchor !== host && !host.contains(anchor)) {
         if (anchor.previousElementSibling !== host) anchor.before(host);
-        if (copyable && host.previousElementSibling !== copyHost) host.before(copyHost);
+        if (copyable) {
+          const title = findCopyHeading(root);
+          if (title) {
+            if (copyHost.getAttribute('data-dock') !== 'title') copyHost.setAttribute('data-dock', 'title');
+            if (copyHost.parentNode !== title || title.firstChild !== copyHost) title.prepend(copyHost);
+          } else {
+            copyHost.removeAttribute('data-dock');
+            if (host.previousElementSibling !== copyHost) host.before(copyHost);
+          }
+        }
       }
     }
     mount();
@@ -1476,20 +1527,18 @@ A page may start/end mid-sentence: translate that fragment without adding missin
       const source = boundRoot;
       copying = true;
       copy.disabled = true;
-      copyStatus.hidden = true;
+      clearCopyFeedback();
       try {
         const target = detectStatement(document, location.href, currentConfig(), source);
         if (target.kind !== 'html' || target.root !== source) throw new Error('题面已变化，请重试。');
         const { markdown, warnings } = statementMarkdown(source);
         await copyMarkdownText(markdown);
         if (boundRoot === source) {
-          copyStatus.textContent = warnings.length ? `已复制；${warnings.join('；')}。` : '已复制 Markdown';
-          copyStatus.hidden = false;
+          showCopyFeedback(warnings.length ? `已复制；${warnings.join('；')}。` : '已复制 Markdown', warnings.length ? 6000 : 2000);
         }
       } catch (error) {
         if (boundRoot === source) {
-          copyStatus.textContent = '复制失败：' + (error.message || '请检查剪贴板权限后重试。');
-          copyStatus.hidden = false;
+          showCopyFeedback('复制失败：' + (error.message || '请检查剪贴板权限后重试。'), 6000);
         }
       } finally { copying = false; copy.disabled = uiBusy || !copyable; }
     };
