@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         QOJ 中文题面 · Responses API
 // @namespace    qoj-translate
-// @version      0.6.0
+// @version      0.6.1
 // @description  HTML 原位翻译、PDF 中文阅读版，保留原文并随时切换；兼容 OpenAI Responses API。
 // @match        https://qoj.ac/problem/*
 // @match        https://qoj.ac/contest/*/problem/*
@@ -674,7 +674,7 @@ A page may start/end mid-sentence: translate that fragment without adding missin
   }
   function createPDFDiagnostic(config, pageURL) {
     const endpoint = new URL(config.endpoint), page = new URL(pageURL);
-    return { scriptVersion: '0.6.0', createdAt: new Date().toISOString(),
+    return { scriptVersion: '0.6.1', createdAt: new Date().toISOString(),
       endpoint: redactDiagnostic(endpoint.origin + endpoint.pathname, config.apiKey),
       pageURL: page.origin + page.pathname, model: redactDiagnostic(config.model, config.apiKey),
       pdfImages: config.pdfImages, maxOutputTokens: config.pdfOutputTokens, autoRepair: config.pdfAutoRepair,
@@ -1125,8 +1125,6 @@ A page may start/end mid-sentence: translate that fragment without adding missin
       .status{overflow:hidden;white-space:nowrap;text-overflow:ellipsis;min-width:0;font-size:12px}
       .error .status{color:#a52c3a}.info{padding:0;min-height:24px;min-width:24px;font-size:12px;flex:none}
       .actions{display:flex;align-items:center;gap:5px;margin-left:auto;flex:none;flex-wrap:wrap;max-width:100%}
-      .copy-status{font-size:12px;color:#65718a;max-width:260px;overflow-wrap:anywhere}
-      .copy-only .languages,.copy-only .status-group,.copy-only .translation-action,.copy-only .overflow-actions{display:none!important}
       .overflow-actions{display:flex;justify-content:flex-end;gap:6px;flex-wrap:wrap;padding:7px 10px;border-top:1px solid #edf0f5;background:#fafbfd;border-radius:0 0 8px 8px}
       .status-detail{margin:0;padding:10px 12px;border-top:1px solid #edf0f5;white-space:pre-wrap;overflow-wrap:anywhere;max-height:160px;overflow:auto;font-size:12px;color:#5d6a7d}
       .status-detail.error{color:#a52c3a;background:#fff8f8}
@@ -1161,10 +1159,28 @@ A page may start/end mid-sentence: translate that fragment without adding missin
     const cancel = element(document, 'button', '取消', { type: 'button', class: 'outline', hidden: '' });
     const settings = element(document, 'button', '⚙', { type: 'button', class: 'icon', 'aria-label': '设置', title: '翻译设置', 'aria-haspopup': 'dialog' });
     const more = element(document, 'button', '⋯', { type: 'button', class: 'icon', 'aria-label': '更多操作', 'aria-expanded': 'false', 'aria-controls': 'overflow-actions', title: '更多操作' });
-    const copy = element(document, 'button', '复制 Markdown', { type: 'button', class: 'outline', hidden: '', title: '复制当前显示的 HTML 题面，不调用 API' });
+    actions.append(translate, cancel, settings, more);
+
+    // Copy is an independent, content-sized action, not an empty translation
+    // shell on native Chinese statements. Both hosts stay inside the site tab.
+    const copyHost = element(document, 'div', null, { 'data-qoj-translator': 'copy', translate: 'no', hidden: '' });
+    const copyShadow = copyHost.attachShadow({ mode: 'closed' });
+    copyShadow.append(element(document, 'style', `
+      :host{display:block;width:fit-content;max-width:100%;margin:4px 0 8px auto;color-scheme:light;font:12px/1.5 system-ui,sans-serif}
+      :host([hidden]),[hidden]{display:none!important}
+      .copy-row{display:flex;justify-content:flex-end;align-items:center;gap:8px;flex-wrap:wrap}
+      button{display:inline-flex;align-items:center;gap:5px;min-height:28px;padding:3px 6px;border:0;border-radius:4px;background:transparent;color:#738096;font:inherit;white-space:nowrap;cursor:pointer}
+      button:hover:not(:disabled){background:#f1f4f8;color:#326bb5}
+      button:focus-visible{outline:2px solid #3975cc;outline-offset:2px}
+      button:disabled{opacity:.45;cursor:default}
+      .copy-status{max-width:min(320px,100%);color:#65718a;overflow-wrap:anywhere}
+    `));
+    const copy = element(document, 'button', null, { type: 'button', title: '复制当前显示的 HTML 题面，不调用 API' });
+    copy.append(element(document, 'span', '⧉', { 'aria-hidden': 'true' }), document.createTextNode('复制 Markdown'));
     const copyStatus = element(document, 'span', '', { class: 'copy-status', role: 'status', hidden: '' });
-    for (const button of [translate, cancel, settings, more]) button.classList.add('translation-action');
-    actions.append(copyStatus, copy, translate, cancel, settings, more);
+    const copyRow = element(document, 'div', null, { class: 'copy-row' });
+    copyRow.append(copyStatus, copy);
+    copyShadow.append(copyRow);
     bar.append(languages, statusGroup, actions);
     const overflow = element(document, 'div', null, { id: 'overflow-actions', class: 'overflow-actions', role: 'group', 'aria-label': '更多操作', hidden: '' });
     const retranslate = element(document, 'button', '重新翻译', { type: 'button', disabled: '' });
@@ -1228,12 +1244,10 @@ A page may start/end mid-sentence: translate that fragment without adding missin
     let nativeChinese = false, languageKey = null, languageProbe = null, copyable = false, copying = false, uiBusy = false;
     const applyLanguageVisibility = () => {
       // Let an already-open settings dialog close normally; don't discard input.
-      const copyOnly = nativeChinese && !translationActive && !dialog.open;
-      shell.classList.toggle('copy-only', copyOnly);
-      if (copyOnly) detail.hidden = true;
-      const hidden = copyOnly && !copyable;
+      const hidden = nativeChinese && !translationActive && !dialog.open;
+      if (hidden) detail.hidden = true;
       if (host.hidden !== hidden) host.hidden = hidden;
-      copy.hidden = !copyable;
+      if (copyHost.hidden === copyable) copyHost.hidden = !copyable;
       copy.disabled = uiBusy || copying || !copyable;
     };
     const cancelLanguageProbe = () => {
@@ -1285,7 +1299,7 @@ A page may start/end mid-sentence: translate that fragment without adding missin
       if (!root) {
         // Keep settings available only INSIDE a known statement panel; never
         // fall back to body/main, where we'd cover unrelated tabs.
-        copy.hidden = true;
+        copyHost.hidden = true;
         const panel = findStatementPanel(document);
         if (panel) {
           if (host.parentNode !== panel) panel.prepend(host);
@@ -1300,6 +1314,7 @@ A page may start/end mid-sentence: translate that fragment without adding missin
       if (root?.previousElementSibling?.matches('[data-qoj-translator="pdf"]')) anchor = root.previousElementSibling;
       if (anchor && anchor !== host && !host.contains(anchor)) {
         if (anchor.previousElementSibling !== host) anchor.before(host);
+        if (copyable && host.previousElementSibling !== copyHost) host.before(copyHost);
       }
     }
     mount();
