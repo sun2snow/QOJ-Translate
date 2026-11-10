@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         QOJ 中文题面 · Responses API
 // @namespace    qoj-translate
-// @version      0.6.4
+// @version      0.6.5
 // @description  HTML 原位翻译、PDF 中文阅读版，保留原文并随时切换；兼容 OpenAI Responses API。
 // @match        https://qoj.ac/problem/*
 // @match        https://qoj.ac/contest/*/problem/*
@@ -674,7 +674,7 @@ A page may start/end mid-sentence: translate that fragment without adding missin
   }
   function createPDFDiagnostic(config, pageURL) {
     const endpoint = new URL(config.endpoint), page = new URL(pageURL);
-    return { scriptVersion: '0.6.4', createdAt: new Date().toISOString(),
+    return { scriptVersion: '0.6.5', createdAt: new Date().toISOString(),
       endpoint: redactDiagnostic(endpoint.origin + endpoint.pathname, config.apiKey),
       pageURL: page.origin + page.pathname, model: redactDiagnostic(config.model, config.apiKey),
       pdfImages: config.pdfImages, maxOutputTokens: config.pdfOutputTokens, autoRepair: config.pdfAutoRepair,
@@ -722,22 +722,29 @@ A page may start/end mid-sentence: translate that fragment without adding missin
     }
     return null;
   }
-  function findCopyHeading(root) {
+  function findCopyDock(root) {
     const doc = root.ownerDocument;
-    // A title embedded in an HTML statement is safe too: translation/export
-    // already excludes our host. Never treat an ordinary "Input" h2 as a title.
-    const internal = root.querySelector('.uoj-problem-title,.problem-title,h1');
-    if (internal && !internal.closest('[data-qoj-translator]')) return internal;
-    // Search only the statement's surrounding content, never global navigation
-    // or a heading belonging to another tab/article. Prefer known title styles.
+    const actionSelector = '.problem-actions,.uoj-problem-actions,[data-problem-actions],.pull-right,.float-right';
+    const eligible = el => {
+      const panel = el.closest('[id^="tab-"],#statement,.tab-pane,[role="tabpanel"]');
+      return !el.contains(root) && !root.contains(el) &&
+        !el.closest('h1,h2,h3,h4,h5,h6,nav,aside,form,article,[data-qoj-translator]') &&
+        !el.querySelector('h1,h2,h3,h4,h5,h6') && (!panel || panel.contains(root)) &&
+        !!(el.compareDocumentPosition(root) & 4);
+    };
     for (let scope = root.parentElement; scope && scope !== doc.body; scope = scope.parentElement) {
-      for (const selector of ['.uoj-problem-title,.problem-title,h1', 'h2']) {
-        const headings = Array.from(scope.querySelectorAll(selector)).filter(heading => {
-          const panel = heading.closest('#tab-statement,#statement,.tab-pane,[role="tabpanel"]');
-          return !root.contains(heading) && !heading.closest('nav,aside,form,article,[data-qoj-translator]') &&
-            (!panel || panel.contains(root)) && !!(heading.compareDocumentPosition(root) & 4);
-        });
-        if (headings.length) return headings.at(-1);
+      // UOJ/QOJ vote widgets identify the existing favorite/vote action row.
+      // Never insert into the widget itself: its own updates may replace it.
+      for (const vote of scope.querySelectorAll('.uoj-click-zan-block,[id^="click-zan-block-problem-"],[id^="click-zan-block-P-"]')) {
+        const row = vote.parentElement?.closest(actionSelector) || vote.parentElement;
+        if (row && row !== vote && eligible(row)) return { element: row, kind: 'actions' };
+      }
+      for (const row of scope.querySelectorAll('.problem-actions,.uoj-problem-actions,[data-problem-actions]')) {
+        if (eligible(row)) return { element: row, kind: 'actions' };
+      }
+      // No recognizable action row: share the metadata, not the centered title.
+      for (const meta of scope.querySelectorAll('.problem-meta,.uoj-problem-meta,.problem-info,.meta')) {
+        if (eligible(meta)) return { element: meta, kind: 'meta' };
       }
       if (scope.matches('main,.uoj-content,.container')) break;
     }
@@ -1185,13 +1192,14 @@ A page may start/end mid-sentence: translate that fragment without adding missin
     const more = element(document, 'button', '⋯', { type: 'button', class: 'icon', 'aria-label': '更多操作', 'aria-expanded': 'false', 'aria-controls': 'overflow-actions', title: '更多操作' });
     actions.append(translate, cancel, settings, more);
 
-    // Dock this independent action in the title when available, with a compact
-    // in-panel fallback. Its visibility always follows the statement tab.
+    // Share the site's existing header actions/metadata, never the title.
+    // Visibility follows the statement tab even when docked outside that tab.
     const copyHost = element(document, 'div', null, { 'data-qoj-translator': 'copy', translate: 'no', hidden: '' });
     const copyShadow = copyHost.attachShadow({ mode: 'closed' });
     copyShadow.append(element(document, 'style', `
       :host{display:block;width:fit-content;max-width:100%;margin:4px 0 8px auto;color-scheme:light;font:12px/1.5 system-ui,sans-serif}
-      :host([data-dock="title"]){float:right;margin:1px 0 0 12px;max-width:100%}
+      :host([data-dock="actions"]),:host([data-dock="meta"]){display:inline-block;float:none;vertical-align:middle;margin:0 0 0 10px;max-width:100%;flex:0 0 auto}
+      :host([data-dock]) button{min-height:20px;padding:0 4px}
       :host([hidden]),[hidden]{display:none!important}
       .copy-row{position:relative;display:flex;justify-content:flex-end;align-items:center}
       button{display:inline-flex;align-items:center;gap:5px;min-height:28px;padding:3px 6px;border:0;border-radius:4px;background:transparent;color:#738096;font:inherit;white-space:nowrap;cursor:pointer}
@@ -1216,6 +1224,7 @@ A page may start/end mid-sentence: translate that fragment without adding missin
     const showCopyFeedback = (text, duration) => {
       clearCopyFeedback();
       copyStatus.textContent = text;
+      copyStatus.style.maxWidth = Math.max(40, Math.min(320, copy.getBoundingClientRect().right - 8, innerWidth - 16)) + 'px';
       copyStatus.hidden = false;
       copyFeedbackTimer = setTimeout(clearCopyFeedback, duration);
     };
@@ -1365,10 +1374,10 @@ A page may start/end mid-sentence: translate that fragment without adding missin
       if (anchor && anchor !== host && !host.contains(anchor)) {
         if (anchor.previousElementSibling !== host) anchor.before(host);
         if (copyable) {
-          const title = findCopyHeading(root);
-          if (title) {
-            if (copyHost.getAttribute('data-dock') !== 'title') copyHost.setAttribute('data-dock', 'title');
-            if (copyHost.parentNode !== title || title.firstChild !== copyHost) title.prepend(copyHost);
+          const dock = findCopyDock(root);
+          if (dock) {
+            if (copyHost.getAttribute('data-dock') !== dock.kind) copyHost.setAttribute('data-dock', dock.kind);
+            if (copyHost.parentNode !== dock.element || dock.element.lastChild !== copyHost) dock.element.append(copyHost);
           } else {
             copyHost.removeAttribute('data-dock');
             if (host.previousElementSibling !== copyHost) host.before(copyHost);
