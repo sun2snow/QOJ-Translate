@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         QOJ 中文题面 · Responses API
 // @namespace    qoj-translate
-// @version      0.6.1
+// @version      0.6.2
 // @description  HTML 原位翻译、PDF 中文阅读版，保留原文并随时切换；兼容 OpenAI Responses API。
 // @match        https://qoj.ac/problem/*
 // @match        https://qoj.ac/contest/*/problem/*
@@ -674,7 +674,7 @@ A page may start/end mid-sentence: translate that fragment without adding missin
   }
   function createPDFDiagnostic(config, pageURL) {
     const endpoint = new URL(config.endpoint), page = new URL(pageURL);
-    return { scriptVersion: '0.6.1', createdAt: new Date().toISOString(),
+    return { scriptVersion: '0.6.2', createdAt: new Date().toISOString(),
       endpoint: redactDiagnostic(endpoint.origin + endpoint.pathname, config.apiKey),
       pageURL: page.origin + page.pathname, model: redactDiagnostic(config.model, config.apiKey),
       pdfImages: config.pdfImages, maxOutputTokens: config.pdfOutputTokens, autoRepair: config.pdfAutoRepair,
@@ -1125,7 +1125,9 @@ A page may start/end mid-sentence: translate that fragment without adding missin
       .status{overflow:hidden;white-space:nowrap;text-overflow:ellipsis;min-width:0;font-size:12px}
       .error .status{color:#a52c3a}.info{padding:0;min-height:24px;min-width:24px;font-size:12px;flex:none}
       .actions{display:flex;align-items:center;gap:5px;margin-left:auto;flex:none;flex-wrap:wrap;max-width:100%}
-      .overflow-actions{display:flex;justify-content:flex-end;gap:6px;flex-wrap:wrap;padding:7px 10px;border-top:1px solid #edf0f5;background:#fafbfd;border-radius:0 0 8px 8px}
+      .overflow-actions{position:fixed;inset:auto;margin:0;width:208px;max-width:calc(100vw - 16px);box-sizing:border-box;padding:5px;border:1px solid #dfe5ee;border-radius:8px;background:#fff;color:#526076;box-shadow:0 8px 28px #1c2d481c;overflow-y:auto;font:13px/1.5 system-ui,sans-serif}
+      .overflow-actions:popover-open{display:flex;flex-direction:column;gap:2px}
+      .overflow-actions button{width:100%;text-align:left;min-height:34px;padding:7px 10px}
       .status-detail{margin:0;padding:10px 12px;border-top:1px solid #edf0f5;white-space:pre-wrap;overflow-wrap:anywhere;max-height:160px;overflow:auto;font-size:12px;color:#5d6a7d}
       .status-detail.error{color:#a52c3a;background:#fff8f8}
       dialog{position:fixed;inset:0;margin:auto;width:520px;max-width:calc(100vw - 32px);max-height:calc(100dvh - 40px);padding:0;border:1px solid #dbe2ec;border-radius:12px;background:#fff;color:#263448;box-shadow:0 18px 60px #14203733;overflow:auto;font:14px/1.6 system-ui,sans-serif}
@@ -1182,7 +1184,10 @@ A page may start/end mid-sentence: translate that fragment without adding missin
     copyRow.append(copyStatus, copy);
     copyShadow.append(copyRow);
     bar.append(languages, statusGroup, actions);
-    const overflow = element(document, 'div', null, { id: 'overflow-actions', class: 'overflow-actions', role: 'group', 'aria-label': '更多操作', hidden: '' });
+    const overflow = element(document, 'div', null, { id: 'overflow-actions', class: 'overflow-actions', role: 'group', 'aria-label': '更多操作', popover: 'auto' });
+    // Associate the invoker so native light-dismiss doesn't reopen the popover
+    // when the same button is clicked a second time.
+    more.popoverTargetElement = overflow;
     const retranslate = element(document, 'button', '重新翻译', { type: 'button', disabled: '' });
     const clear = element(document, 'button', '清除译文缓存', { type: 'button' });
     const diagnostic = element(document, 'button', '导出 PDF 诊断', { type: 'button', disabled: '' });
@@ -1245,7 +1250,7 @@ A page may start/end mid-sentence: translate that fragment without adding missin
     const applyLanguageVisibility = () => {
       // Let an already-open settings dialog close normally; don't discard input.
       const hidden = nativeChinese && !translationActive && !dialog.open;
-      if (hidden) detail.hidden = true;
+      if (hidden) { detail.hidden = true; closeMore(); }
       if (host.hidden !== hidden) host.hidden = hidden;
       if (copyHost.hidden === copyable) copyHost.hidden = !copyable;
       copy.disabled = uiBusy || copying || !copyable;
@@ -1288,12 +1293,15 @@ A page may start/end mid-sentence: translate that fragment without adding missin
         try { root = findStatementRoot(document, currentConfig().selector, boundRoot); } catch { root = null; }
       }
       if (root !== boundRoot) {
+        closeMore();
         cancelLanguageProbe(); languageKey = null; nativeChinese = false; copyable = false;
         copyStatus.hidden = true;
         boundRoot = root;
         if (dialog.open) dialog.close();
         rootListener(root);
       }
+      // Top-layer popovers don't inherit an ancestor tab's display:none.
+      if (!root || !host.getClientRects().length) closeMore();
       // Don't move an open dialog, unless its original source has disappeared.
       if (dialog.open && host.isConnected) return;
       if (!root) {
@@ -1329,16 +1337,65 @@ A page may start/end mid-sentence: translate that fragment without adding missin
     observer.observe(document.body, { childList: true, characterData: true, subtree: true,
       attributes: true, attributeFilter: ['class', 'style', 'hidden', 'aria-hidden', 'src', 'data', 'lang'] });
 
-    const closeMore = (restoreFocus = false) => {
-      overflow.hidden = true;
+    function closeMore(restoreFocus = false) {
+      if (overflow.matches(':popover-open')) overflow.hidePopover();
       more.setAttribute('aria-expanded', 'false');
-      if (restoreFocus) more.focus();
+      if (restoreFocus && more.getClientRects().length) more.focus();
+    }
+    const openMore = (last = false) => {
+      if (!host.getClientRects().length || more.disabled) return;
+      overflow.showPopover({ source: more });
+      // Viewport-relative placement stays inside narrow/zoomed screens and
+      // flips above the button when there isn't enough space below it.
+      const viewport = window.visualViewport;
+      const x = viewport?.offsetLeft || 0, y = viewport?.offsetTop || 0;
+      const width = viewport?.width || innerWidth, height = viewport?.height || innerHeight;
+      overflow.style.maxHeight = Math.max(0, height - 16) + 'px';
+      const anchor = more.getBoundingClientRect(), box = overflow.getBoundingClientRect();
+      const left = Math.max(x + 8, Math.min(anchor.right - box.width, x + width - box.width - 8));
+      const desiredTop = anchor.bottom + box.height + 6 <= y + height - 8 ? anchor.bottom + 6 : anchor.top - box.height - 6;
+      const top = Math.max(y + 8, Math.min(desiredTop, y + height - box.height - 8));
+      overflow.style.left = left + 'px';
+      overflow.style.top = top + 'px';
+      more.setAttribute('aria-expanded', 'true');
+      const items = Array.from(overflow.querySelectorAll('button:not(:disabled)'));
+      (last ? items.at(-1) : items[0])?.focus({ preventScroll: true });
     };
-    more.onclick = () => {
-      const open = overflow.hidden;
-      overflow.hidden = !open;
-      more.setAttribute('aria-expanded', String(open));
+    let moreWasOpen = false;
+    more.addEventListener('pointerdown', () => { moreWasOpen = overflow.matches(':popover-open'); });
+    more.onclick = event => {
+      event.preventDefault(); // Placement/focus are managed before the next paint.
+      // Native light-dismiss may already have run between pointerdown/click.
+      if (event.detail ? moreWasOpen : overflow.matches(':popover-open')) closeMore(true);
+      else openMore();
     };
+    more.addEventListener('keydown', event => {
+      if (!['ArrowDown', 'ArrowUp'].includes(event.key)) return;
+      event.preventDefault();
+      openMore(event.key === 'ArrowUp');
+    });
+    overflow.addEventListener('toggle', () => more.setAttribute('aria-expanded', String(overflow.matches(':popover-open'))));
+    overflow.addEventListener('keydown', event => {
+      if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
+      event.preventDefault();
+      const items = Array.from(overflow.querySelectorAll('button:not(:disabled)'));
+      const current = items.indexOf(shadow.activeElement);
+      const next = event.key === 'Home' ? 0 : event.key === 'End' ? items.length - 1
+        : (current + (event.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length;
+      items[next]?.focus({ preventScroll: true });
+    });
+    overflow.addEventListener('focusout', event => {
+      // relatedTarget is known before the new element receives focus. Checking
+      // activeElement in a microtask here can close the popup during a pointer
+      // focus transition, before the intended action gets its click event.
+      if (!overflow.contains(event.relatedTarget) && event.relatedTarget !== more) closeMore();
+    });
+    window.addEventListener('resize', () => closeMore());
+    window.visualViewport?.addEventListener('resize', () => closeMore());
+    window.visualViewport?.addEventListener('scroll', () => closeMore());
+    document.addEventListener('scroll', event => {
+      if (!event.composedPath().includes(host)) closeMore();
+    }, true);
     document.addEventListener('pointerdown', event => {
       if (!event.composedPath().includes(host)) closeMore();
     });
@@ -1346,7 +1403,7 @@ A page may start/end mid-sentence: translate that fragment without adding missin
       if (!event.composedPath().includes(overflow) && event.target !== more) closeMore();
     });
     shadow.addEventListener('keydown', event => {
-      if (event.key === 'Escape' && !overflow.hidden && !dialog.open) {
+      if (event.key === 'Escape' && overflow.matches(':popover-open') && !dialog.open) {
         closeMore(true);
         event.preventDefault();
         event.stopPropagation();
